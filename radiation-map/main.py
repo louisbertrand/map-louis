@@ -1,11 +1,29 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
+from fastapi.templating import Jinja2Templates
+from fastapi.staticfiles import StaticFiles
 import duckdb
-from datetime import datetime, timedelta
+import os
+import httpx
+import asyncio
+import json
+import logging
+import time
 import random
+import traceback
+from typing import List, Dict, Any, Optional, Generator
+from pydantic import BaseModel
+from datetime import datetime, timedelta
+from contextlib import contextmanager
+from pathlib import Path
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Initialize FastAPI app
 app = FastAPI()
 
 # Enable CORS
@@ -17,71 +35,150 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Set up templates
+templates = Jinja2Templates(directory="templates")
+
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Initialize DuckDB
+# Constants
+SAFECAST_API_BASE = "https://tt.safecast.org"
+DEVICE_URNS = [
+    "geigiecast:62007",
+    "geigiecast-zen:65049",
+    "geigiecast:62106",
+    "geigiecast:63209"
+]
+
+# Database connection management
+@contextmanager
+def get_db(raise_http_exception: bool = True) -> Generator[duckdb.DuckDBPyConnection, None, None]:
+    """Get a database connection with proper cleanup.
+    
+    Args:
+        raise_http_exception: If True, raises HTTPException on error. Set to False during initialization.
+    """
+    conn = None
+    try:
+        conn = duckdb.connect('safecast_data.db')
+        yield conn
+    except Exception as e:
+        logger.error(f"Database connection error: {e}")
+        if raise_http_exception:
+            raise HTTPException(status_code=500, detail="Database connection error")
+        raise  # Re-raise the exception if not raising HTTPException
+    finally:
+        if conn:
+            conn.close()
+
 def init_db():
-    conn = duckdb.connect('safecast_data.db')
-    
-    # Create tables if they don't exist
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS devices (
-            device_urn VARCHAR(50) PRIMARY KEY,
-            device INTEGER,
-            device_class VARCHAR(50),
-            dev_test BOOLEAN,
-            service_uploaded TIMESTAMP,
-            service_transport VARCHAR(100)
-        )
-    """)
-    
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS measurements (
-            id BIGINT,
-            device_urn VARCHAR(50),
-            when_captured TIMESTAMP,
-            lnd_7318u FLOAT
-        )
-    """)
-    
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS locations (
-            id BIGINT,
-            device_urn VARCHAR(50),
-            when_captured TIMESTAMP,
-            latitude FLOAT,
-            longitude FLOAT
-        )
-    """)
-    
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS transport_info (
-            device_urn VARCHAR(50) PRIMARY KEY,
-            query_ip VARCHAR(50),
-            status VARCHAR(20),
-            as_info VARCHAR(100),
-            city VARCHAR(100),
-            country VARCHAR(100),
-            country_code VARCHAR(10),
-            isp VARCHAR(100),
-            latitude FLOAT,
-            longitude FLOAT,
-            org VARCHAR(100),
-            region VARCHAR(10),
-            region_name VARCHAR(100),
-            timezone VARCHAR(50),
-            zip_code VARCHAR(20)
-        )
-    """)
-    
-    # Create indexes for better query performance
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_measurements_device_urn ON measurements(device_urn)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_measurements_when_captured ON measurements(when_captured)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_locations_device_urn ON locations(device_urn)")
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_locations_when_captured ON locations(when_captured)")
-    
-    return conn
+    """Initialize the database with required tables."""
+    with get_db(raise_http_exception=False) as conn:
+        try:
+            # Drop and recreate tables to ensure clean state
+            drop_queries = [
+                "DROP TABLE IF EXISTS measurements",
+                "DROP TABLE IF EXISTS devices",
+                "DROP TABLE IF EXISTS transport_info",
+                "DROP TABLE IF EXISTS device_fetch_status"
+            ]
+            
+            for query in drop_queries:
+                try:
+                    conn.execute(query)
+                except Exception as e:
+                    logger.warning(f"Error dropping table: {e}")
+            
+            # Commit after dropping tables
+            conn.commit()
+            
+            # Create devices table
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS devices (
+                device_urn VARCHAR PRIMARY KEY,
+                device_id INTEGER,
+                device_class VARCHAR,
+                device_sn VARCHAR,
+                device_contact_name VARCHAR,
+                device_contact_email VARCHAR,
+                last_seen TIMESTAMP,
+                latitude DOUBLE,
+                longitude DOUBLE,
+                last_reading DOUBLE,
+                dev_test BOOLEAN,
+                dev_dashboard VARCHAR,
+                last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )""")
+            
+            # Create measurements table
+            conn.execute("""
+            CREATE SEQUENCE IF NOT EXISTS measurements_id_seq;
+            
+            CREATE TABLE IF NOT EXISTS measurements (
+                id INTEGER PRIMARY KEY DEFAULT nextval('measurements_id_seq'),
+                device_urn TEXT,
+                when_captured TIMESTAMP,
+                lnd_7318u REAL,
+                latitude REAL,
+                longitude REAL,
+                service_uploaded TEXT,
+                service_transport TEXT,
+                recorded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(device_urn, when_captured, lnd_7318u)
+            )""")
+            
+            # Create device_fetch_status table
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS device_fetch_status (
+                device_urn TEXT PRIMARY KEY,
+                last_fetched TIMESTAMP,
+                last_measurement_time TIMESTAMP,
+                fetch_status TEXT,
+                error_message TEXT,
+                FOREIGN KEY (device_urn) REFERENCES devices(device_urn)
+            )""")
+            
+            # Add all devices
+            for device_urn in DEVICE_URNS:
+                device_id = device_urn.split(':')[-1]  # Extract device ID from URN
+                
+                # Add the device if it doesn't exist
+                conn.execute("""
+                    INSERT OR IGNORE INTO devices (
+                        device_urn, device_id, device_class, dev_test, dev_dashboard
+                    ) VALUES (?, ?, ?, ?, ?)
+                """, (
+                    device_urn,
+                    int(device_id) if device_id.isdigit() else 0,  # Convert to int if possible
+                    'GeigerCounter',
+                    False,
+                    f'https://safecast.org/tilemap/?y1=90&x1=-180&y2=-90&x2=180&l=0&m=0&sense=1&since=0&until=0&devices={device_id}'
+                ))
+                
+                # Initialize fetch status if it doesn't exist
+                conn.execute("""
+                    INSERT OR IGNORE INTO device_fetch_status (device_urn, last_fetched, fetch_status)
+                    VALUES (?, NULL, 'pending')
+                """, (device_urn,))
+            
+            # Create indexes for better query performance
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_measurements_device_urn ON measurements(device_urn)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_measurements_when_captured ON measurements(when_captured)")
+            
+            conn.commit()
+            logger.info("Database initialized successfully")
+            
+        except Exception as e:
+            try:
+                conn.rollback()
+            except:
+                pass
+            logger.error(f"Error initializing database: {e}")
+            logger.error(traceback.format_exc())
+            raise
+
+# Initialize the database when the application starts
+init_db()
 
 def add_sample_data(conn):
     # Create tables if they don't exist
@@ -133,10 +230,10 @@ def add_sample_data(conn):
     # Add some sample locations
     base_time = datetime.now() - timedelta(days=30)
     for day in range(30):
-        timestamp = base_time + timedelta(days=day, hours=random.randint(0, 23))
+        timestamp = base_time + timedelta(days=day, hours=0)
         # Add some random variation to the location
-        lat = 35.6895 + (random.random() - 0.5) * 0.1
-        lon = 139.6917 + (random.random() - 0.5) * 0.1
+        lat = 35.6895 + (0 - 0.5) * 0.1
+        lon = 139.6917 + (0 - 0.5) * 0.1
         
         try:
             conn.execute(
@@ -187,7 +284,7 @@ def add_sample_data(conn):
         for hour in range(0, 24, 3):  # Every 3 hours
             timestamp = base_time + timedelta(days=day, hours=hour)
             # Add some realistic variation (CPM typically ranges from 5-60 in normal conditions)
-            cpm = 20 + (random.random() - 0.5) * 10  # Random value around 20 CPM
+            cpm = 20 + (0 - 0.5) * 10  # Random value around 20 CPM
             
             try:
                 conn.execute(
@@ -202,154 +299,335 @@ def add_sample_data(conn):
 
 # API Endpoints
 @app.get("/", response_class=HTMLResponse)
-async def read_root():
-    with open("templates/index.html") as f:
-        return f.read()
+async def read_root(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 @app.get("/api/devices")
 async def get_devices():
     try:
-        db_file = 'safecast_data.db'
-        
-        # Initialize database if it doesn't exist
-        if not os.path.exists(db_file) or os.path.getsize(db_file) == 0:
-            print("Database not found or empty, initializing...")
-            conn = init_db()
-            add_sample_data(conn)
-        else:
-            # Connect to existing database
-            conn = duckdb.connect(db_file)
-            
-            # Check if database is properly initialized
+        with get_db() as conn:
             try:
-                result = conn.execute("SELECT COUNT(*) FROM devices").fetchone()
-                if not result or result[0] == 0:
-                    print("Database is empty, adding sample data...")
-                    add_sample_data(conn)
-            except Exception as e:
-                print(f"Error checking database: {e}")
-                print("Reinitializing database...")
-                conn = init_db()
-                add_sample_data(conn)
-        
-        # First, get all devices
-        devices_query = """
-            SELECT device_urn, device, device_class 
-            FROM devices
-        """
-        
-        devices_result = conn.execute(devices_query).fetchall()
-        
-        if not devices_result:
-            return {"devices": []}
-        
-        devices = []
-        for device_row in devices_result:
-            device_urn = device_row[0]
-            device_id = device_row[1]
-            device_class = device_row[2]
-            
-            # Get the latest location for this device
-            location_query = """
-                SELECT latitude, longitude, when_captured 
-                FROM locations 
-                WHERE device_urn = ? 
-                ORDER BY when_captured DESC 
-                LIMIT 1
-            """
-            
-            location_result = conn.execute(location_query, (device_urn,)).fetchone()
-            
-            # Get transport info if available
-            transport_query = """
-                SELECT city, country 
-                FROM transport_info 
-                WHERE device_urn = ?
-                LIMIT 1
-            """
-            
-            transport_result = conn.execute(transport_query, (device_urn,)).fetchone()
-            
-            # Build device data
-            device_data = {
-                "device_urn": device_urn,
-                "device_id": device_id,
-                "device_class": device_class,
-                "latitude": None,
-                "longitude": None,
-                "last_seen": None,
-                "location": None
-            }
-            
-            # Add location data if available
-            if location_result:
-                lat, lon, when = location_result
-                if lat is not None and lon is not None:
-                    device_data["latitude"] = float(lat)
-                    device_data["longitude"] = float(lon)
-                if when is not None:
-                    device_data["last_seen"] = when.isoformat()
-            
-            # Add location string if transport info is available
-            if transport_result and transport_result[0] and transport_result[1]:
-                device_data["location"] = f"{transport_result[0]}, {transport_result[1]}"
-            
-            devices.append(device_data)
-        
-        return {"devices": devices}
-        
+                # First, get all devices
+                devices_query = """
+                    SELECT device_urn, device_id, device_class, last_seen, latitude, longitude
+                    FROM devices
+                """
+                
+                devices_result = conn.execute(devices_query).fetchall()
+                
+                if not devices_result:
+                    return {"devices": []}
+                
+                devices = []
+                for device_row in devices_result:
+                    try:
+                        device_urn = device_row[0]
+                        device_id = device_row[1]
+                        device_class = device_row[2]
+                        last_seen = device_row[3]
+                        latitude = device_row[4]
+                        longitude = device_row[5]
+                        
+                        # Get transport info if available
+                        transport_query = """
+                            SELECT city, country 
+                            FROM transport_info 
+                            WHERE device_urn = ?
+                            LIMIT 1
+                        """
+                        
+                        transport_result = None
+                        try:
+                            transport_result = conn.execute(transport_query, (device_urn,)).fetchone()
+                        except Exception as transport_error:
+                            logger.warning(f"Error fetching transport info for device {device_urn}: {transport_error}")
+                        
+                        # Build device data
+                        device_data = {
+                            "device_urn": device_urn,
+                            "device_id": device_id,
+                            "device_class": device_class,
+                            "latitude": float(latitude) if latitude is not None else None,
+                            "longitude": float(longitude) if longitude is not None else None,
+                            "last_seen": last_seen.isoformat() if hasattr(last_seen, 'isoformat') else str(last_seen) if last_seen else None,
+                            "location": None
+                        }
+                        
+                        # Add location string if transport info is available
+                        if transport_result and transport_result[0] and transport_result[1]:
+                            device_data["location"] = f"{transport_result[0]}, {transport_result[1]}"
+                        
+                        devices.append(device_data)
+                    except Exception as device_error:
+                        logger.error(f"Error processing device row {device_row}: {device_error}")
+                        continue
+                
+                return {"devices": devices}
+                
+            except Exception as query_error:
+                logger.error(f"Database query error in get_devices: {query_error}")
+                logger.error(traceback.format_exc())
+                raise HTTPException(status_code=500, detail=f"Database query error: {str(query_error)}")
+                
+    except HTTPException:
+        raise  # Re-raise HTTP exceptions
     except Exception as e:
-        error_msg = f"Error in get_devices: {str(e)}"
-        print(error_msg)
+        error_msg = f"Unexpected error in get_devices: {str(e)}"
+        logger.error(error_msg)
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=error_msg)
 
 @app.get("/api/measurements/{device_urn}")
-async def get_measurements(device_urn: str, days: int = 7):
+async def get_measurements(device_urn: str, days: int = Query(7, gt=0, le=365, description="Number of days of data to return")):
+    """Get measurements for a specific device over the last N days."""
     try:
-        conn = duckdb.connect('safecast_data.db')
-        
-        # Get device info
-        device = conn.execute(
-            "SELECT device_urn, device, device_class FROM devices WHERE device_urn = ?", 
-            (device_urn,)
-        ).fetchone()
-        
-        if not device:
-            raise HTTPException(status_code=404, detail="Device not found")
-        
-        # Get measurements for the last N days
-        cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
-        
-        # Use explicit CAST to ensure proper type comparison
-        result = conn.execute("""
-            SELECT when_captured, lnd_7318u 
-            FROM measurements 
-            WHERE device_urn = ? 
-            AND CAST(when_captured AS TIMESTAMP) >= CAST(? AS TIMESTAMP)
-            ORDER BY when_captured
-        """, (device_urn, cutoff_date)).fetchall()
-        
-        measurements = [
-            {
-                "when_captured": row[0].isoformat() if hasattr(row[0], 'isoformat') else row[0],
-                "lnd_7318u": float(row[1]) if row[1] is not None else None
-            }
-            for row in result
-        ]
-        
-        return {
-            "device_urn": device[0],
-            "device_id": device[1],
-            "device_class": device[2],
-            "measurements": measurements
-        }
+        with get_db() as conn:
+            # Verify the device exists
+            device_exists = conn.execute(
+                "SELECT 1 FROM devices WHERE device_urn = ?",
+                (device_urn,)
+            ).fetchone()
+            
+            if not device_exists:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            # Calculate the date range
+            end_date = datetime.utcnow()
+            start_date = end_date - timedelta(days=days)
+            
+            # Get measurements for the device within the date range
+            result = conn.execute("""
+                SELECT 
+                    id,
+                    device_urn,
+                    when_captured,
+                    lnd_7318u,
+                    latitude,
+                    longitude,
+                    service_uploaded,
+                    service_transport,
+                    recorded_at
+                FROM measurements
+                WHERE device_urn = ? 
+                AND when_captured BETWEEN CAST(? AS TIMESTAMP) AND CAST(? AS TIMESTAMP)
+                ORDER BY when_captured ASC
+            """, (device_urn, start_date.isoformat(), end_date.isoformat()))
+            
+            # Convert to list of dicts
+            measurements = []
+            columns = [col[0] for col in result.description] if result.description else []
+            for row in result.fetchall():
+                measurements.append(dict(zip(columns, row)))
+            
+            return {"measurements": measurements}
+    
+    except HTTPException as he:
+        raise he
     except Exception as e:
-        print(f"Error in get_measurements: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = f"Error fetching measurements for device {device_urn}: {str(e)}"
+        logger.error(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
 
-# Create templates directory if it doesn't exist
-import os
+# Create necessary directories if they don't exist
 os.makedirs("templates", exist_ok=True)
+os.makedirs("static/css", exist_ok=True)
+os.makedirs("static/js", exist_ok=True)
+
+# Endpoint to fetch and store device data from Safecast API
+@app.get("/api/fetch-device-data")
+async def fetch_device_data(background_tasks: BackgroundTasks):
+    """
+    Fetches the latest data for all configured devices from the Safecast API
+    and stores it in the local database.
+    """
+    with get_db(raise_http_exception=True) as conn:
+        try:
+            # Check if we already have a recent fetch in progress for any device
+            status = conn.execute(
+                "SELECT fetch_status, last_fetched FROM device_fetch_status WHERE fetch_status = 'fetching'"
+            ).fetchone()
+            
+            if status and status[1] and (datetime.utcnow() - datetime.fromisoformat(status[1])).total_seconds() < 300:
+                return {
+                    "status": "already_fetching",
+                    "message": "A fetch is already in progress. Please wait a few minutes before trying again."
+                }
+            
+            # Start background tasks for each device
+            for device_urn in DEVICE_URNS:
+                # Update the status to show we're starting a fetch for this device
+                conn.execute("""
+                    INSERT OR REPLACE INTO device_fetch_status (device_urn, last_fetched, fetch_status)
+                    VALUES (?, CURRENT_TIMESTAMP, 'fetching')
+                """, (device_urn,))
+                
+                # Start the background task for this device
+                background_tasks.add_task(fetch_and_store_device_data, device_urn)
+            
+            conn.commit()
+            
+            return {
+                "status": "fetch_started",
+                "message": f"Fetching data for {len(DEVICE_URNS)} devices in the background"
+            }
+            
+        except Exception as e:
+            error_msg = f"Error starting data fetch: {str(e)}"
+            logger.error(error_msg)
+            
+            # Update the status to show the error for all devices
+            for device_urn in DEVICE_URNS:
+                conn.execute("""
+                    UPDATE device_fetch_status 
+                    SET fetch_status = 'error', error_message = ?
+                    WHERE device_urn = ?
+                """, (str(e), device_urn))
+            conn.commit()
+            
+            raise HTTPException(status_code=500, detail=error_msg)
+
+async def fetch_and_store_device_data(device_urn):
+    """
+    Fetches device data from the Safecast API and stores it in the database.
+    This function is designed to be run in the background.
+    
+    Args:
+        device_urn: The URN of the device to fetch data for
+    """
+    with get_db(raise_http_exception=True) as conn:
+        try:
+            # Extract device ID from URN (handle both formats: 'geigiecast:123' and 'geigiecast-zen:123')
+            device_id = device_urn.split(':')[-1]  # Get the part after the last colon
+            
+            # Build the API URL for the device endpoint
+            url = f"{SAFECAST_API_BASE}/device/{device_urn}"
+            
+            # Make the API request
+            async with httpx.AsyncClient() as client:
+                response = await client.get(url, timeout=30.0)
+                response.raise_for_status()
+                
+                # Parse the response as JSON
+                data = response.json()
+                
+                # Check if we have current values
+                if 'current_values' not in data:
+                    logger.warning(f"No current values found for device {device_urn}")
+                    return
+                
+                current_values = data['current_values']
+                
+                # Check if there's a measurement
+                if 'lnd_7318u' not in current_values or current_values['lnd_7318u'] is None:
+                    logger.warning(f"No radiation measurement found for device {device_urn}")
+                    return
+                
+                # Update device information with location if available
+                if current_values.get('loc_lat') and current_values.get('loc_lon'):
+                    conn.execute("""
+                        UPDATE devices 
+                        SET 
+                            latitude = ?,
+                            longitude = ?,
+                            last_seen = ?
+                        WHERE device_urn = ?
+                    """, (
+                        current_values['loc_lat'],
+                        current_values['loc_lon'],
+                        current_values.get('when_captured', '').replace('Z', '+00:00'),
+                        device_urn
+                    ))
+                    conn.commit()
+                
+                # Prepare the measurement data
+                measurement = {
+                    'captured_at': current_values.get('when_captured', '').replace('Z', '+00:00'),
+                    'latitude': current_values.get('loc_lat'),
+                    'longitude': current_values.get('loc_lon'),
+                    'value': current_values['lnd_7318u'],
+                    'unit': 'cpm',
+                    'device_urn': device_urn,
+                    'device_id': current_values.get('device'),
+                    'device_class': current_values.get('device_class', 'GeigerCounter')
+                }
+                
+                # Convert to a list for consistent processing
+                measurements_data = [measurement] if measurement['value'] is not None else []
+            
+            # Store the measurements in the database
+            new_measurements = 0
+            for measurement in measurements_data:
+                try:
+                    captured_at = measurement.get('captured_at')
+                    
+                    conn.execute("""
+                        INSERT OR IGNORE INTO measurements (
+                            device_urn, when_captured, lnd_7318u, latitude, longitude,
+                            service_uploaded, service_transport
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    """, (
+                        device_urn,
+                        captured_at,
+                        measurement.get('value'),
+                        measurement.get('latitude'),
+                        measurement.get('longitude'),
+                        measurement.get('service_uploaded'),
+                        measurement.get('service_transport')
+                    ))
+                    new_measurements += 1
+                except Exception as e:
+                    logger.error(f"Error inserting measurement for device {device_urn}: {e}")
+            
+            # Update the device's last seen time and location if we have new measurements
+            if new_measurements > 0:
+                # First, ensure the device exists in the devices table
+                conn.execute("""
+                    INSERT OR IGNORE INTO devices (device_urn, device_id, device_class)
+                    VALUES (?, ?, ?)
+                """, (device_urn, device_id, 'GeigerCounter'))
+                
+                # Then update the last seen time and location
+                conn.execute("""
+                    UPDATE devices 
+                    SET last_seen = CURRENT_TIMESTAMP,
+                        latitude = (SELECT latitude FROM measurements 
+                                  WHERE device_urn = ? 
+                                  ORDER BY when_captured DESC LIMIT 1),
+                        longitude = (SELECT longitude FROM measurements 
+                                   WHERE device_urn = ? 
+                                   ORDER BY when_captured DESC LIMIT 1)
+                    WHERE device_urn = ?
+                """, (device_urn, device_urn, device_urn))
+            
+            # Update fetch status
+            conn.execute("""
+                UPDATE device_fetch_status 
+                SET last_fetched = CURRENT_TIMESTAMP,
+                    last_measurement_time = (SELECT MAX(when_captured) FROM measurements WHERE device_urn = ?),
+                    fetch_status = 'success',
+                    error_message = NULL
+                WHERE device_urn = ?
+            """, (device_urn, device_urn))
+            
+            conn.commit()
+            logger.info(f"Successfully fetched {new_measurements} new measurements for device {device_urn}")
+            
+        except Exception as e:
+            error_msg = f"Error in background fetch for device {device_urn}: {str(e)}"
+            logger.error(error_msg)
+            
+            # Update fetch status with error
+            conn.execute("""
+                UPDATE device_fetch_status 
+                SET fetch_status = 'error', 
+                    error_message = ?,
+                    last_fetched = CURRENT_TIMESTAMP
+                WHERE device_urn = ?
+            """, (device_urn, str(e)))
+            conn.commit()
+
+# Initialize the database when the application starts
+init_db()
 
 # Create basic HTML template
 with open("templates/index.html", "w") as f:
@@ -400,21 +678,21 @@ with open("static/js/main.js", "w") as f:
 
         // Load sensor data
         try {
-            const response = await fetch('/api/sensors');
+            const response = await fetch('/api/devices');
             const data = await response.json();
             
             // Add markers for each sensor
-            data.sensors.forEach(sensor => {
+            data.devices.forEach(sensor => {
                 const marker = L.marker([sensor.latitude, sensor.longitude])
                     .addTo(map)
                     .bindPopup(`
-                        <h3>${sensor.name}</h3>
-                        <p>${sensor.description}</p>
-                        <button onclick="loadSensorData(${sensor.id}, '${sensor.name}')">Show History</button>
+                        <h3>${sensor.device_urn}</h3>
+                        <p>${sensor.device_class}</p>
+                        <button onclick="loadSensorData('${sensor.device_urn}')">Show History</button>
                     `);
                 
-                marker.sensorId = sensor.id;
-                marker.sensorName = sensor.name;
+                marker.sensorId = sensor.device_urn;
+                marker.sensorName = sensor.device_urn;
             });
             
         } catch (error) {
@@ -422,14 +700,14 @@ with open("static/js/main.js", "w") as f:
         }
     }
 
-    async function loadSensorData(sensorId, sensorName) {
+    async function loadSensorData(sensorId) {
         try {
             const response = await fetch(`/api/measurements/${sensorId}?days=30`);
             const data = await response.json();
             
             // Prepare chart data
-            const timestamps = data.measurements.map(m => new Date(m.timestamp));
-            const values = data.measurements.map(m => m.value);
+            const timestamps = data.measurements.map(m => new Date(m.when_captured));
+            const values = data.measurements.map(m => m.lnd_7318u);
             
             // Create or update chart
             const ctx = document.getElementById('chart').getContext('2d');
@@ -443,7 +721,7 @@ with open("static/js/main.js", "w") as f:
                 data: {
                     labels: timestamps,
                     datasets: [{
-                        label: `Radiation Level (${data.unit}) - ${data.sensor_name}`,
+                        label: `Radiation Level - ${sensorId}`,
                         data: values,
                         borderColor: 'rgb(75, 192, 192)',
                         tension: 0.1
@@ -465,7 +743,7 @@ with open("static/js/main.js", "w") as f:
                         y: {
                             title: {
                                 display: true,
-                                text: `Radiation (${data.unit})`
+                                text: 'Radiation'
                             }
                         }
                     }
@@ -483,9 +761,20 @@ with open("static/js/main.js", "w") as f:
 
 if __name__ == "__main__":
     import uvicorn
-    # Initialize database
-    conn = init_db()
-    conn.close()
     
-    # Run the server
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    try:
+        # Initialize database
+        init_db()
+        
+        # Run the server
+        uvicorn.run(
+            "main:app",
+            host="0.0.0.0",
+            port=8000,
+            reload=True,
+            log_level="info"
+        )
+    except Exception as e:
+        logger.error(f"Error starting application: {e}")
+        logger.error(traceback.format_exc())
+        raise

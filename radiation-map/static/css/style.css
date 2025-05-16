@@ -38,6 +38,95 @@
     transition: var(--transition);
 }
 
+/* Popup styles */
+.leaflet-popup-content {
+    margin: 0;
+    padding: 12px 15px 10px;
+    line-height: 1.5;
+    font-size: 0.9rem;
+}
+
+.leaflet-popup-content h5 {
+    margin: 0 0 8px 0;
+    font-size: 1.1rem;
+    color: #333;
+    display: flex;
+    align-items: center;
+}
+
+.leaflet-popup-content h5 i {
+    color: #dc3545;
+}
+
+.leaflet-popup-content .badge {
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.25rem 0.5rem;
+    border-radius: 0.25rem;
+}
+
+.device-details {
+    background-color: #f8f9fa;
+    border-radius: 0.25rem;
+    padding: 0.5rem 0.75rem;
+    margin: 0.5rem 0;
+}
+
+.device-details .text-muted {
+    color: #6c757d !important;
+    font-size: 0.85rem;
+}
+
+.device-details .current-reading {
+    color: #dc3545;
+    font-weight: 600;
+}
+
+.leaflet-popup-content .chart-container {
+    position: relative;
+    height: 200px;
+    margin: 12px 0 8px;
+    background: white;
+    border-radius: 0.25rem;
+    padding: 8px;
+    border: 1px solid #e9ecef;
+    box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075);
+}
+
+.leaflet-popup-content .popup-loading {
+    color: #6c757d;
+    font-size: 0.85rem;
+    margin: 0.5rem 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.leaflet-popup-content .popup-error {
+    margin: 0.5rem 0 0;
+    padding: 0.5rem 0.75rem;
+    font-size: 0.85rem;
+    border-radius: 0.25rem;
+}
+
+/* Make the popup wider on larger screens */
+@media (min-width: 768px) {
+    .leaflet-popup-content {
+        min-width: 350px;
+    }
+}
+
+/* Main chart container (not in popup) */
+#chart-container {
+    position: relative;
+    height: 300px;
+    margin: 20px 0;
+    background: white;
+    border-radius: 8px;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    padding: 15px;
+}
+
 /* Loading Overlay */
 .loading {
     position: fixed;

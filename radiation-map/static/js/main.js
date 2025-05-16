@@ -163,11 +163,8 @@ async function initMap() {
             popupContent.style.padding = '8px';
             popupContent.innerHTML = `
                 <div style="margin-bottom: 8px;">
-                    <div style="font-weight: bold; font-size: 14px; color: #333;">
+                    <div style="font-weight: bold; font-size: 14px; color: #333; margin-bottom: 8px;">
                         Sensor ${sensor.device_urn.split(':')[1]}
-                    </div>
-                    <div style="font-size: 12px; color: #666; margin-top: 2px;">
-                        ${sensor.latitude?.toFixed(4)}, ${sensor.longitude?.toFixed(4)}
                     </div>
                 </div>
                 <div id="chart-${sensor.device_urn}" style="width: 100%; height: 100px; margin-top: 8px;"></div>

@@ -202,7 +202,6 @@
 ::-webkit-scrollbar-thumb:hover {
     background: #555;
 }
-}
 
 /* Responsive adjustments */
 @media (max-width: 768px) {

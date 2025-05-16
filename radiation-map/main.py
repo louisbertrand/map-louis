@@ -38,22 +38,20 @@ def init_db():
     
     conn.execute("""
         CREATE TABLE IF NOT EXISTS measurements (
-            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            id BIGINT,
             device_urn VARCHAR(50),
             when_captured TIMESTAMP,
-            lnd_7318u FLOAT,
-            FOREIGN KEY (device_urn) REFERENCES devices(device_urn)
+            lnd_7318u FLOAT
         )
     """)
     
     conn.execute("""
         CREATE TABLE IF NOT EXISTS locations (
-            id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            id BIGINT,
             device_urn VARCHAR(50),
             when_captured TIMESTAMP,
             latitude FLOAT,
-            longitude FLOAT,
-            FOREIGN KEY (device_urn) REFERENCES devices(device_urn)
+            longitude FLOAT
         )
     """)
     
@@ -73,8 +71,7 @@ def init_db():
             region VARCHAR(10),
             region_name VARCHAR(100),
             timezone VARCHAR(50),
-            zip_code VARCHAR(20),
-            FOREIGN KEY (device_urn) REFERENCES devices(device_urn)
+            zip_code VARCHAR(20)
         )
     """)
     
@@ -87,6 +84,9 @@ def init_db():
     return conn
 
 def add_sample_data(conn):
+    # Create tables if they don't exist
+    init_db()
+    
     # Add a sample device
     device = (
         "safecast:12345",  # device_urn
@@ -97,20 +97,38 @@ def add_sample_data(conn):
         "api"              # service_transport
     )
     
-    # Clear existing data
-    conn.execute("DELETE FROM measurements")
-    conn.execute("DELETE FROM locations")
-    conn.execute("DELETE FROM transport_info")
-    conn.execute("DELETE FROM devices")
+    # Clear existing data if tables exist
+    try:
+        conn.execute("DELETE FROM measurements")
+    except Exception as e:
+        print(f"Warning: Could not clear measurements table: {e}")
+    
+    try:
+        conn.execute("DELETE FROM locations")
+    except Exception as e:
+        print(f"Warning: Could not clear locations table: {e}")
+    
+    try:
+        conn.execute("DELETE FROM transport_info")
+    except Exception as e:
+        print(f"Warning: Could not clear transport_info table: {e}")
+    
+    try:
+        conn.execute("DELETE FROM devices")
+    except Exception as e:
+        print(f"Warning: Could not clear devices table: {e}")
     
     # Insert sample device
-    conn.execute(
-        """
-        INSERT INTO devices (device_urn, device, device_class, dev_test, service_uploaded, service_transport)
-        VALUES (?, ?, ?, ?, ?, ?)
-        """,
-        device
-    )
+    try:
+        conn.execute(
+            """
+            INSERT INTO devices (device_urn, device, device_class, dev_test, service_uploaded, service_transport)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            device
+        )
+    except Exception as e:
+        print(f"Error inserting device: {e}")
     
     # Add some sample locations
     base_time = datetime.now() - timedelta(days=30)
@@ -120,42 +138,48 @@ def add_sample_data(conn):
         lat = 35.6895 + (random.random() - 0.5) * 0.1
         lon = 139.6917 + (random.random() - 0.5) * 0.1
         
-        conn.execute(
-            """
-            INSERT INTO locations (device_urn, when_captured, latitude, longitude)
-            VALUES (?, ?, ?, ?)
-            """,
-            (device[0], timestamp.isoformat(), lat, lon)
-        )
+        try:
+            conn.execute(
+                """
+                INSERT INTO locations (device_urn, when_captured, latitude, longitude)
+                VALUES (?, ?, ?, ?)
+                """,
+                (device[0], timestamp.isoformat(), lat, lon)
+            )
+        except Exception as e:
+            print(f"Error inserting location: {e}")
     
     # Add transport info
-    transport_info = (
-        device[0],  # device_urn
-        "192.168.1.1",  # query_ip
-        "success",  # status
-        "AS12345 Example ISP",  # as_info
-        "Tokyo",  # city
-        "Japan",  # country
-        "JP",  # country_code
-        "Example ISP",  # isp
-        35.6895,  # latitude
-        139.6917,  # longitude
-        "Example Org",  # org
-        "13",  # region
-        "Tokyo",  # region_name
-        "Asia/Tokyo",  # timezone
-        "100-0001"  # zip_code
-    )
-    
-    conn.execute(
-        """
-        INSERT INTO transport_info (
-            device_urn, query_ip, status, as_info, city, country, country_code,
-            isp, latitude, longitude, org, region, region_name, timezone, zip_code
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        transport_info
-    )
+    try:
+        transport_info = (
+            device[0],  # device_urn
+            "192.168.1.1",  # query_ip
+            "success",  # status
+            "AS12345 Example ISP",  # as_info
+            "Tokyo",  # city
+            "Japan",  # country
+            "JP",  # country_code
+            "Example ISP",  # isp
+            35.6895,  # latitude
+            139.6917,  # longitude
+            "Example Org",  # org
+            "13",  # region
+            "Tokyo",  # region_name
+            "Asia/Tokyo",  # timezone
+            "100-0001"  # zip_code
+        )
+        
+        conn.execute(
+            """
+            INSERT INTO transport_info (
+                device_urn, query_ip, status, as_info, city, country, country_code,
+                isp, latitude, longitude, org, region, region_name, timezone, zip_code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            transport_info
+        )
+    except Exception as e:
+        print(f"Error inserting transport info: {e}")
     
     # Add some sample measurements
     base_time = datetime.now() - timedelta(days=30)
@@ -165,13 +189,16 @@ def add_sample_data(conn):
             # Add some realistic variation (CPM typically ranges from 5-60 in normal conditions)
             cpm = 20 + (random.random() - 0.5) * 10  # Random value around 20 CPM
             
-            conn.execute(
-                """
-                INSERT INTO measurements (device_urn, when_captured, lnd_7318u)
-                VALUES (?, ?, ?)
-                """,
-                (device[0], timestamp.isoformat(), cpm)
-            )
+            try:
+                conn.execute(
+                    """
+                    INSERT INTO measurements (device_urn, when_captured, lnd_7318u)
+                    VALUES (?, ?, ?)
+                    """,
+                    (device[0], timestamp.isoformat(), cpm)
+                )
+            except Exception as e:
+                print(f"Error inserting measurement: {e}")
 
 # API Endpoints
 @app.get("/", response_class=HTMLResponse)
@@ -182,97 +209,143 @@ async def read_root():
 @app.get("/api/devices")
 async def get_devices():
     try:
-        conn = duckdb.connect('safecast_data.db')
+        db_file = 'safecast_data.db'
         
-        # First, check if the tables exist
-        tables = conn.execute("""
-            SELECT table_name 
-            FROM information_schema.tables 
-            WHERE table_schema = 'main' 
-            AND table_name IN ('devices', 'locations', 'transport_info')
-        """).fetchall()
-        
-        if len(tables) < 3:
-            # If any table is missing, initialize the database
+        # Initialize database if it doesn't exist
+        if not os.path.exists(db_file) or os.path.getsize(db_file) == 0:
+            print("Database not found or empty, initializing...")
             conn = init_db()
+            add_sample_data(conn)
+        else:
+            # Connect to existing database
+            conn = duckdb.connect(db_file)
+            
+            # Check if database is properly initialized
+            try:
+                result = conn.execute("SELECT COUNT(*) FROM devices").fetchone()
+                if not result or result[0] == 0:
+                    print("Database is empty, adding sample data...")
+                    add_sample_data(conn)
+            except Exception as e:
+                print(f"Error checking database: {e}")
+                print("Reinitializing database...")
+                conn = init_db()
+                add_sample_data(conn)
         
-        # Get the latest location for each device
-        query = """
-            WITH latest_locations AS (
-                SELECT device_urn, latitude, longitude, when_captured,
-                       ROW_NUMBER() OVER (PARTITION BY device_urn ORDER BY when_captured DESC) as rn
-                FROM locations
-            )
-            SELECT d.device_urn, d.device, d.device_class, 
-                   ll.latitude, ll.longitude, ll.when_captured,
-                   ti.city, ti.country
-            FROM devices d
-            LEFT JOIN latest_locations ll ON d.device_urn = ll.device_urn AND (ll.rn = 1 OR ll.rn IS NULL)
-            LEFT JOIN transport_info ti ON d.device_urn = ti.device_urn
+        # First, get all devices
+        devices_query = """
+            SELECT device_urn, device, device_class 
+            FROM devices
         """
         
-        result = conn.execute(query).fetchall()
+        devices_result = conn.execute(devices_query).fetchall()
+        
+        if not devices_result:
+            return {"devices": []}
         
         devices = []
-        for row in result:
-            try:
-                devices.append({
-                    "device_urn": row[0],
-                    "device_id": row[1],
-                    "device_class": row[2],
-                    "latitude": float(row[3]) if row[3] is not None else None,
-                    "longitude": float(row[4]) if row[4] is not None else None,
-                    "last_seen": row[5].isoformat() if row[5] is not None else None,
-                    "location": f"{row[6]}, {row[7]}" if row[6] and row[7] else None
-                })
-            except Exception as e:
-                print(f"Error processing device row: {row}")
-                print(f"Error: {e}")
-                continue
-                
+        for device_row in devices_result:
+            device_urn = device_row[0]
+            device_id = device_row[1]
+            device_class = device_row[2]
+            
+            # Get the latest location for this device
+            location_query = """
+                SELECT latitude, longitude, when_captured 
+                FROM locations 
+                WHERE device_urn = ? 
+                ORDER BY when_captured DESC 
+                LIMIT 1
+            """
+            
+            location_result = conn.execute(location_query, (device_urn,)).fetchone()
+            
+            # Get transport info if available
+            transport_query = """
+                SELECT city, country 
+                FROM transport_info 
+                WHERE device_urn = ?
+                LIMIT 1
+            """
+            
+            transport_result = conn.execute(transport_query, (device_urn,)).fetchone()
+            
+            # Build device data
+            device_data = {
+                "device_urn": device_urn,
+                "device_id": device_id,
+                "device_class": device_class,
+                "latitude": None,
+                "longitude": None,
+                "last_seen": None,
+                "location": None
+            }
+            
+            # Add location data if available
+            if location_result:
+                lat, lon, when = location_result
+                if lat is not None and lon is not None:
+                    device_data["latitude"] = float(lat)
+                    device_data["longitude"] = float(lon)
+                if when is not None:
+                    device_data["last_seen"] = when.isoformat()
+            
+            # Add location string if transport info is available
+            if transport_result and transport_result[0] and transport_result[1]:
+                device_data["location"] = f"{transport_result[0]}, {transport_result[1]}"
+            
+            devices.append(device_data)
+        
         return {"devices": devices}
         
     except Exception as e:
-        print(f"Error in get_devices: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        error_msg = f"Error in get_devices: {str(e)}"
+        print(error_msg)
+        raise HTTPException(status_code=500, detail=error_msg)
 
 @app.get("/api/measurements/{device_urn}")
 async def get_measurements(device_urn: str, days: int = 7):
-    conn = duckdb.connect('safecast_data.db')
-    
-    # Get device info
-    device = conn.execute(
-        "SELECT device_urn, device, device_class FROM devices WHERE device_urn = ?", 
-        (device_urn,)
-    ).fetchone()
-    
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
-    
-    # Get measurements for the last N days
-    cutoff_date = datetime.now() - timedelta(days=days)
-    
-    result = conn.execute("""
-        SELECT when_captured, lnd_7318u 
-        FROM measurements 
-        WHERE device_urn = ? AND when_captured >= ?
-        ORDER BY when_captured
-    """, (device_urn, cutoff_date.isoformat())).fetchall()
-    
-    measurements = [
-        {
-            "when_captured": row[0].isoformat(),
-            "lnd_7318u": float(row[1]) if row[1] is not None else None
+    try:
+        conn = duckdb.connect('safecast_data.db')
+        
+        # Get device info
+        device = conn.execute(
+            "SELECT device_urn, device, device_class FROM devices WHERE device_urn = ?", 
+            (device_urn,)
+        ).fetchone()
+        
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+        
+        # Get measurements for the last N days
+        cutoff_date = (datetime.now() - timedelta(days=days)).isoformat()
+        
+        # Use explicit CAST to ensure proper type comparison
+        result = conn.execute("""
+            SELECT when_captured, lnd_7318u 
+            FROM measurements 
+            WHERE device_urn = ? 
+            AND CAST(when_captured AS TIMESTAMP) >= CAST(? AS TIMESTAMP)
+            ORDER BY when_captured
+        """, (device_urn, cutoff_date)).fetchall()
+        
+        measurements = [
+            {
+                "when_captured": row[0].isoformat() if hasattr(row[0], 'isoformat') else row[0],
+                "lnd_7318u": float(row[1]) if row[1] is not None else None
+            }
+            for row in result
+        ]
+        
+        return {
+            "device_urn": device[0],
+            "device_id": device[1],
+            "device_class": device[2],
+            "measurements": measurements
         }
-        for row in result
-    ]
-    
-    return {
-        "device_urn": device[0],
-        "device_id": device[1],
-        "device_class": device[2],
-        "measurements": measurements
-    }
+    except Exception as e:
+        print(f"Error in get_measurements: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # Create templates directory if it doesn't exist
 import os

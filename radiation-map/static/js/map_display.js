@@ -1,5 +1,6 @@
 let map;
 let chart = null;
+let popupCharts = {}; // Keep track of chart instances in popups
 
 async function initMap() {
     // Initialize map centered on the Toronto area
@@ -27,7 +28,7 @@ async function initMap() {
             // Create a green circular marker with sensor value
             const reading = Math.round(sensor.last_reading || 0);
             const marker = L.circleMarker([sensor.latitude, sensor.longitude], {
-                radius: 15,
+                radius: 20, // Increased size
                 fillColor: '#2ecc71',
                 color: '#27ae60',
                 weight: 2,
@@ -35,12 +36,12 @@ async function initMap() {
                 fillOpacity: 0.8
             }).addTo(map);
             
-            // Add the reading value as a div icon
+            // Add the reading value as a div icon with improved styling
             const icon = L.divIcon({
                 className: 'sensor-value-label',
-                html: `<div style="color: white; font-weight: bold; font-size: 12px;">${reading}</div>`,
-                iconSize: [30, 30],
-                iconAnchor: [15, 15]
+                html: `<div style="color: white; font-weight: bold; font-size: 14px; display: flex; justify-content: center; align-items: center; width: 100%; height: 100%; text-align: center; margin-top: -5px;">${reading}</div>`,
+                iconSize: [40, 40], // Increased size
+                iconAnchor: [20, 20] // Centered
             });
             
             // Make this marker non-interactive
@@ -49,22 +50,27 @@ async function initMap() {
             // Get the sensor ID for display
             const sensorId = sensor.device_id || sensor.device_urn.split(':').pop();
             
-            // Restore original popup with graph placeholder
+            // Popup with just sensor ID and chart
             marker.bindPopup(`
-                <div style="width: 300px;">
-                    <h3>Sensor ${sensorId}</h3>
-                    <div id="popup-graph-${sensorId}" style="width: 100%; height: 150px;"></div>
+                <div style="width: 280px;">
+                    <h3 style="margin: 5px 0; text-align: center; padding-bottom: 5px;">Sensor ${sensorId}</h3>
+                    <div id="popup-graph-${sensorId}" style="width: 100%; height: 200px;"></div>
                 </div>
-            `);
+            `, { maxWidth: 300 });
             
-            // Remove the temporary basic click listener
-            // marker.on('click', function(e) { ... }); // This line will be deleted
-
             // Restore original popupopen event for graph creation
             marker.on('popupopen', function() {
                 setTimeout(() => {
-                    createSimpleGraph(sensor.device_urn, `popup-graph-${sensorId}`);
+                    createChartGraph(sensor.device_urn, `popup-graph-${sensorId}`);
                 }, 100); // 100ms delay to ensure popup is in DOM
+            });
+
+            // Clean up chart when popup closes
+            marker.on('popupclose', function() {
+                if (popupCharts[`popup-graph-${sensorId}`]) {
+                    popupCharts[`popup-graph-${sensorId}`].destroy();
+                    delete popupCharts[`popup-graph-${sensorId}`];
+                }
             });
             
             marker.sensorId = sensor.device_urn;
@@ -75,72 +81,184 @@ async function initMap() {
     }
 }
 
-async function createSimpleGraph(sensorId, containerId) {
+async function createChartGraph(sensorId, containerId) {
     try {
+        // Show loading spinner
+        document.getElementById(containerId).innerHTML = `
+            <div style="display: flex; justify-content: center; align-items: center; height: 150px;">
+                <div style="text-align: center;">
+                    <div class="spinner" style="border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 0 auto;"></div>
+                    <p style="margin-top: 10px;">Loading measurement data...</p>
+                </div>
+            </div>
+            <style>
+                @keyframes spin {
+                    0% { transform: rotate(0deg); }
+                    100% { transform: rotate(360deg); }
+                }
+            </style>
+        `;
+        
+        console.log(`Fetching data for sensor ${sensorId}`);
         const response = await fetch(`/api/measurements/${sensorId}?days=7`);
         const data = await response.json();
+        console.log(`Received data for ${sensorId}:`, data);
         
         if (!data.measurements || data.measurements.length === 0) {
-            document.getElementById(containerId).innerHTML = "No data available";
+            document.getElementById(containerId).innerHTML = `
+                <div style="padding: 10px; text-align: center;">
+                    <p>No measurement data available</p>
+                    <button onclick="retryFetchData('${sensorId}', '${containerId}')" 
+                            style="margin-top: 10px; padding: 5px 10px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                        Retry
+                    </button>
+                </div>
+            `;
             return;
         }
         
-        // Get last 24 measurements for the mini graph
-        const measurements = data.measurements.slice(-24);
+        // Get all measurements for the chart
+        const measurements = data.measurements;
+        const container = document.getElementById(containerId);
+        
+        // Clear any existing content
+        container.innerHTML = '';
+        
+        // Create a canvas for the chart
         const canvas = document.createElement('canvas');
-        canvas.width = 300;
-        canvas.height = 150;
+        container.appendChild(canvas);
         
-        document.getElementById(containerId).innerHTML = '';
-        document.getElementById(containerId).appendChild(canvas);
-        
+        // Prepare data for Chart.js
         const ctx = canvas.getContext('2d');
         
-        // Draw simple graph
-        const values = measurements.map(m => m.lnd_7318u);
-        const maxValue = Math.max(...values, 40); // Ensure at least 0-40 range
+        // Clean up any existing chart
+        if (popupCharts[containerId]) {
+            popupCharts[containerId].destroy();
+            delete popupCharts[containerId];
+        }
         
-        // Draw axes
-        ctx.beginPath();
-        ctx.moveTo(40, 10);
-        ctx.lineTo(40, 120);
-        ctx.lineTo(280, 120);
-        ctx.stroke();
+        // Format the data for Chart.js
+        const chartData = measurements.map(m => ({
+            x: new Date(m.when_captured),
+            y: m.lnd_7318u
+        }));
         
-        // Draw labels
-        ctx.font = '10px Arial';
-        ctx.textAlign = 'right';
-        ctx.fillText('40 cpm', 35, 15);
-        ctx.fillText('20 cpm', 35, 65);
-        ctx.fillText('0 cpm', 35, 120);
-        
-        // Draw time labels
-        ctx.textAlign = 'center';
-        const firstTime = new Date(measurements[0].when_captured);
-        const lastTime = new Date(measurements[measurements.length-1].when_captured);
-        
-        ctx.fillText(firstTime.getHours() + ':00', 50, 135);
-        ctx.fillText(lastTime.getHours() + ':00', 270, 135);
-        
-        // Draw line
-        ctx.beginPath();
-        ctx.strokeStyle = 'blue';
-        ctx.lineWidth = 2;
-        
-        values.forEach((value, i) => {
-            const x = 40 + (i * 240 / (values.length - 1));
-            const y = 120 - (value / maxValue * 110);
-            
-            if (i === 0) ctx.moveTo(x, y);
-            else ctx.lineTo(x, y);
+        // Create a Chart.js chart that matches the screenshot style
+        popupCharts[containerId] = new Chart(ctx, {
+            type: 'line',
+            data: {
+                datasets: [{
+                    label: 'Radiation (cpm)',
+                    data: chartData,
+                    borderColor: 'rgba(54, 162, 235, 1)',
+                    backgroundColor: 'rgba(54, 162, 235, 0.1)',
+                    borderWidth: 2,
+                    pointRadius: 0,
+                    fill: true,
+                    tension: 0.2
+                }]
+            },
+            options: {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        display: false
+                    },
+                    tooltip: {
+                        mode: 'index',
+                        intersect: false,
+                        callbacks: {
+                            label: function(context) {
+                                return `${Math.round(context.raw.y)} cpm`;
+                            }
+                        }
+                    }
+                },
+                scales: {
+                    y: {
+                        title: {
+                            display: true,
+                            text: 'Radiation (cpm)',
+                            position: 'left'
+                        },
+                        beginAtZero: true,
+                        grid: {
+                            display: true,
+                            drawBorder: false
+                        },
+                        ticks: {
+                            stepSize: 20
+                        }
+                    },
+                    x: {
+                        type: 'time',
+                        time: {
+                            unit: 'hour',
+                            displayFormats: {
+                                hour: 'HH:mm'
+                            }
+                        },
+                        grid: {
+                            display: false
+                        },
+                        ticks: {
+                            maxRotation: 0,
+                            autoSkip: true,
+                            maxTicksLimit: 5
+                        }
+                    }
+                }
+            }
         });
         
-        ctx.stroke();
-        
     } catch (error) {
-        console.error('Error creating graph:', error);
-        document.getElementById(containerId).innerHTML = "Error loading data";
+        console.error('Error creating chart:', error);
+        document.getElementById(containerId).innerHTML = `
+            <div style="padding: 10px; text-align: center;">
+                <p>Error loading data: ${error.message}</p>
+                <button onclick="retryFetchData('${sensorId}', '${containerId}')" 
+                        style="margin-top: 10px; padding: 5px 10px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                    Retry
+                </button>
+            </div>
+        `;
     }
+}
+
+// Add a helper function to retry fetching data
+function retryFetchData(sensorId, containerId) {
+    // Show loading indicator
+    document.getElementById(containerId).innerHTML = `
+        <div style="display: flex; justify-content: center; align-items: center; height: 150px;">
+            <div style="text-align: center;">
+                <div class="spinner" style="border: 4px solid #f3f3f3; border-top: 4px solid #3498db; border-radius: 50%; width: 30px; height: 30px; animation: spin 1s linear infinite; margin: 0 auto;"></div>
+                <p style="margin-top: 10px;">Refreshing data...</p>
+            </div>
+        </div>
+    `;
+    
+    // Trigger a data refresh
+    fetch('/api/fetch-device-data')
+        .then(response => {
+            // Wait 3 seconds to allow background tasks to complete
+            setTimeout(() => {
+                // Now fetch the measurements again
+                createChartGraph(sensorId, containerId);
+            }, 3000);
+        })
+        .catch(error => {
+            console.error("Error refreshing data:", error);
+            document.getElementById(containerId).innerHTML = `
+                <div style="padding: 10px; text-align: center;">
+                    <p>Error refreshing data: ${error.message}</p>
+                    <button onclick="retryFetchData('${sensorId}', '${containerId}')" 
+                            style="margin-top: 10px; padding: 5px 10px; background: #4CAF50; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                        Try Again
+                    </button>
+                </div>
+            `;
+        });
 }
 
 async function loadSensorData(sensorId) {
@@ -148,9 +266,16 @@ async function loadSensorData(sensorId) {
         const response = await fetch(`/api/measurements/${sensorId}?days=30`);
         const data = await response.json();
         
-        // Prepare chart data
-        const timestamps = data.measurements.map(m => new Date(m.when_captured));
-        const values = data.measurements.map(m => m.lnd_7318u);
+        if (!data.measurements || data.measurements.length === 0) {
+            console.warn(`No measurement data available for ${sensorId}`);
+            return;
+        }
+        
+        // Format the data for Chart.js
+        const chartData = data.measurements.map(m => ({
+            x: new Date(m.when_captured),
+            y: m.lnd_7318u
+        }));
         
         // Create or update chart
         const ctx = document.getElementById('chart').getContext('2d');
@@ -162,17 +287,26 @@ async function loadSensorData(sensorId) {
         chart = new Chart(ctx, {
             type: 'line',
             data: {
-                labels: timestamps,
                 datasets: [{
                     label: `Radiation Level - ${sensorId}`,
-                    data: values,
+                    data: chartData,
                     borderColor: 'rgb(75, 192, 192)',
-                    tension: 0.1
+                    backgroundColor: 'rgba(75, 192, 192, 0.1)',
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.2
                 }]
             },
             options: {
                 responsive: true,
                 scales: {
+                    y: {
+                        title: {
+                            display: true,
+                            text: 'Radiation (cpm)'
+                        },
+                        beginAtZero: true
+                    },
                     x: {
                         type: 'time',
                         time: {
@@ -181,12 +315,6 @@ async function loadSensorData(sensorId) {
                         title: {
                             display: true,
                             text: 'Date'
-                        }
-                    },
-                    y: {
-                        title: {
-                            display: true,
-                            text: 'Radiation'
                         }
                     }
                 }

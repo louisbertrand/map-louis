@@ -488,8 +488,19 @@ async def get_measurements(device_urn: str, days: int = Query(7, gt=0, le=365, d
             end_date = datetime.utcnow()
             start_date = end_date - timedelta(days=days)
             
+            # Add debugging
+            logger.info(f"Fetching measurements for {device_urn} from {start_date.isoformat()} to {end_date.isoformat()}")
+            
+            # Check if any data exists for this device
+            count = conn.execute(
+                "SELECT COUNT(*) FROM measurements WHERE device_urn = ?",
+                (device_urn,)
+            ).fetchone()[0]
+            
+            logger.info(f"Found {count} total measurements for {device_urn}")
+            
             # Get measurements for the device within the date range
-            result = conn.execute("""
+            query = """
                 SELECT 
                     id,
                     device_urn,
@@ -504,13 +515,47 @@ async def get_measurements(device_urn: str, days: int = Query(7, gt=0, le=365, d
                 WHERE device_urn = ? 
                 AND when_captured BETWEEN CAST(? AS TIMESTAMP) AND CAST(? AS TIMESTAMP)
                 ORDER BY when_captured ASC
-            """, (device_urn, start_date.isoformat(), end_date.isoformat()))
+            """
+            
+            # Log the query and parameters for debugging
+            logger.info(f"Executing query: {query} with params: {device_urn}, {start_date.isoformat()}, {end_date.isoformat()}")
+            
+            result = conn.execute(query, (device_urn, start_date.isoformat(), end_date.isoformat()))
             
             # Convert to list of dicts
             measurements = []
             columns = [col[0] for col in result.description] if result.description else []
             for row in result.fetchall():
                 measurements.append(dict(zip(columns, row)))
+            
+            logger.info(f"Query returned {len(measurements)} measurements")
+            
+            # If no measurements found within time range, return all measurements for this device (limited to 10)
+            if not measurements:
+                logger.info(f"No measurements found in date range, returning most recent measurements")
+                result = conn.execute("""
+                    SELECT 
+                        id,
+                        device_urn,
+                        when_captured,
+                        lnd_7318u,
+                        latitude,
+                        longitude,
+                        service_uploaded,
+                        service_transport,
+                        recorded_at
+                    FROM measurements
+                    WHERE device_urn = ? 
+                    ORDER BY when_captured DESC
+                    LIMIT 10
+                """, (device_urn,))
+                
+                measurements = []
+                columns = [col[0] for col in result.description] if result.description else []
+                for row in result.fetchall():
+                    measurements.append(dict(zip(columns, row)))
+                
+                logger.info(f"Fallback query returned {len(measurements)} measurements")
             
             return {"measurements": measurements}
     
@@ -519,6 +564,7 @@ async def get_measurements(device_urn: str, days: int = Query(7, gt=0, le=365, d
     except Exception as e:
         error_msg = f"Error fetching measurements for device {device_urn}: {str(e)}"
         logger.error(error_msg)
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=error_msg)
 
 # Create necessary directories if they don't exist
@@ -736,10 +782,77 @@ async def fetch_and_store_device_data(device_urn):
                                 (latitude, longitude, last_seen_dt, radiation_value, device_urn)
                             )
                             
-                            # For simplicity, we are not inserting into 'measurements' table here.
-                            # If historical tracking per reading is needed, that logic would go here,
-                            # potentially checking if this exact reading (by timestamp) already exists.
-                            # For now, we just update the 'devices' table with the latest.
+                            # Insert the current reading into measurements table if it doesn't exist
+                            conn.execute("""
+                                INSERT OR IGNORE INTO measurements (
+                                    device_urn, when_captured, lnd_7318u, latitude, longitude, 
+                                    service_uploaded, service_transport
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                device_urn,
+                                last_seen_dt,
+                                radiation_value,
+                                latitude,
+                                longitude,
+                                current_values.get('service_uploaded'),
+                                current_values.get('service_transport')
+                            ))
+                            
+                            # Now, process the geiger_history array
+                            geiger_history = data.get('geiger_history', [])
+                            if geiger_history and isinstance(geiger_history, list):
+                                logger.info(f"Processing {len(geiger_history)} geiger_history entries for {device_urn}")
+                                entries_inserted = 0
+                                
+                                for entry in geiger_history:
+                                    try:
+                                        # Only process valid entries
+                                        if not isinstance(entry, dict):
+                                            continue
+                                            
+                                        entry_when_captured = entry.get('when_captured')
+                                        entry_reading = entry.get('lnd_7318u')
+                                        entry_lat = entry.get('loc_lat')
+                                        entry_lon = entry.get('loc_lon')
+                                        
+                                        if not (entry_when_captured and entry_reading):
+                                            continue
+                                            
+                                        # Convert values to appropriate types
+                                        try:
+                                            entry_reading = float(entry_reading)
+                                            entry_dt = datetime.fromisoformat(entry_when_captured.replace("Z", "+00:00"))
+                                            entry_lat = float(entry_lat) if entry_lat is not None else None
+                                            entry_lon = float(entry_lon) if entry_lon is not None else None
+                                        except (ValueError, TypeError) as ve:
+                                            logger.warning(f"Value conversion error for history entry: {ve}")
+                                            continue
+                                            
+                                        # Insert the historical reading
+                                        conn.execute("""
+                                            INSERT OR IGNORE INTO measurements (
+                                                device_urn, when_captured, lnd_7318u, latitude, longitude,
+                                                service_uploaded, service_transport
+                                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                                        """, (
+                                            device_urn,
+                                            entry_dt,
+                                            entry_reading,
+                                            entry_lat,
+                                            entry_lon,
+                                            entry.get('service_uploaded'),
+                                            entry.get('service_transport')
+                                        ))
+                                        entries_inserted += 1
+                                        
+                                    except Exception as entry_error:
+                                        logger.warning(f"Error processing history entry: {entry_error}")
+                                        continue
+                                
+                                logger.info(f"Inserted {entries_inserted} historical entries for {device_urn}")
+                            else:
+                                logger.info(f"No valid geiger_history found for {device_urn}")
+                            
                             logger.info(f"Updated device {device_urn} with: lat={latitude}, lon={longitude}, reading={radiation_value}, seen={last_seen_dt}")
                             conn.commit()
                         fetch_status = "completed" 

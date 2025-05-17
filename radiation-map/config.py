@@ -13,3 +13,17 @@ DEFAULT_MAP_ZOOM = 10
 
 # Refresh intervals
 AUTO_REFRESH_INTERVAL_SECONDS = 300  # 5 minutes 
+
+# Email notification settings
+EMAIL_ENABLED = True  # Set to True to enable email notifications
+EMAIL_SERVER = "smtp.gmail.com"
+EMAIL_PORT = 587
+EMAIL_USERNAME = "your-email@gmail.com"
+EMAIL_PASSWORD = "your-app-password"  # Use app password for Gmail
+EMAIL_FROM = "Radiation Alert <your-email@gmail.com>"
+
+# SMS notification settings (via Twilio)
+SMS_ENABLED = False  # Set to True to enable SMS notifications
+TWILIO_ACCOUNT_SID = "your-twilio-account-sid"
+TWILIO_AUTH_TOKEN = "your-twilio-auth-token"
+TWILIO_FROM_NUMBER = "+1234567890"  # Your Twilio phone number 

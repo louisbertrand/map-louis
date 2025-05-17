@@ -59,6 +59,7 @@
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Device ID</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Seen</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Alert</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
                         </tr>
                     </thead>
@@ -71,6 +72,12 @@
                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                                 {{ device.last_seen or 'Never' }}
                             </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                <button onclick="showAlertConfig('{{ device.device_urn }}')"
+                                        class="px-2 py-1 bg-yellow-500 text-white rounded-md hover:bg-yellow-600 focus:outline-none">
+                                    <i class="fas fa-bell mr-1"></i> Configure Alert
+                                </button>
+                            </td>
                             <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
                                 <button onclick="removeDevice('{{ device.device_urn }}')" 
                                         class="text-red-600 hover:text-red-900">
@@ -81,6 +88,75 @@
                         {% endfor %}
                     </tbody>
                 </table>
+            </div>
+        </div>
+        
+        <!-- Alert Configuration Modal -->
+        <div id="alertConfigModal" class="fixed inset-0 bg-gray-600 bg-opacity-50 hidden flex items-center justify-center z-50">
+            <div class="bg-white rounded-lg shadow-xl max-w-md w-full p-6">
+                <h3 class="text-lg font-semibold mb-4">Configure Alert Threshold</h3>
+                <form id="alertConfigForm" class="space-y-4">
+                    <input type="hidden" id="alertDeviceUrn">
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">CPM Threshold</label>
+                        <div class="mt-1 relative rounded-md shadow-sm">
+                            <input type="number" id="thresholdCpm" min="1" required 
+                                   class="block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                            <div class="absolute inset-y-0 right-0 pr-3 flex items-center">
+                                <span class="text-gray-500 sm:text-sm">CPM</span>
+                            </div>
+                        </div>
+                        <p class="mt-1 text-sm text-gray-500">Alert will trigger when CPM exceeds this value</p>
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">Email for Alerts</label>
+                        <input type="email" id="alertEmail" 
+                               class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">SMS Number for Alerts</label>
+                        <input type="tel" id="alertSms" placeholder="+1234567890"
+                               class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                        <p class="mt-1 text-sm text-gray-500">Include country code (e.g., +1 for US/Canada)</p>
+                    </div>
+                    
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">Alert Cooldown (minutes)</label>
+                        <input type="number" id="alertCooldown" min="15" value="60"
+                               class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                        <p class="mt-1 text-sm text-gray-500">Minimum time between alerts for the same device</p>
+                    </div>
+                    
+                    <div class="flex items-center">
+                        <input type="checkbox" id="alertEnabled" 
+                               class="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded">
+                        <label for="alertEnabled" class="ml-2 block text-sm text-gray-900">
+                            Enable Alert
+                        </label>
+                    </div>
+                    
+                    <div class="mt-4 border-t border-gray-200 pt-4">
+                        <button type="button" id="testAlertBtn" onclick="testAlert()"
+                                class="px-4 py-2 bg-yellow-500 text-white rounded-md hover:bg-yellow-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-yellow-500">
+                            <i class="fas fa-paper-plane mr-2"></i> Send Test Alert
+                        </button>
+                        <p class="mt-1 text-sm text-gray-500">Send a test notification with current settings</p>
+                    </div>
+                    
+                    <div class="flex justify-end space-x-3 pt-4">
+                        <button type="button" onclick="closeAlertModal()"
+                                class="px-4 py-2 bg-gray-300 text-gray-700 rounded-md hover:bg-gray-400 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-gray-500">
+                            Cancel
+                        </button>
+                        <button type="submit"
+                                class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">
+                            Save Alert Configuration
+                        </button>
+                    </div>
+                </form>
             </div>
         </div>
         
@@ -197,6 +273,163 @@
             } catch (error) {
                 alert(`Error: ${error.message}`);
                 console.error('Error:', error);
+            }
+        }
+        
+        // Alert Configuration Modal Functions
+        function showAlertConfig(deviceUrn) {
+            document.getElementById('alertDeviceUrn').value = deviceUrn;
+            
+            // Fetch existing alert config for this device
+            fetchAlertConfig(deviceUrn);
+            
+            // Show the modal
+            document.getElementById('alertConfigModal').classList.remove('hidden');
+        }
+        
+        function closeAlertModal() {
+            document.getElementById('alertConfigModal').classList.add('hidden');
+            document.getElementById('alertConfigForm').reset();
+        }
+        
+        async function fetchAlertConfig(deviceUrn) {
+            try {
+                const response = await fetch(`/api/admin/alerts/${encodeURIComponent(deviceUrn)}`);
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    
+                    // Populate form with existing data
+                    document.getElementById('thresholdCpm').value = data.threshold_cpm || 60;
+                    document.getElementById('alertEmail').value = data.alert_email || '';
+                    document.getElementById('alertSms').value = data.alert_sms || '';
+                    document.getElementById('alertCooldown').value = data.alert_cooldown_minutes || 60;
+                    document.getElementById('alertEnabled').checked = data.alert_enabled || false;
+                } else {
+                    // New alert config
+                    document.getElementById('thresholdCpm').value = 60;
+                    document.getElementById('alertEmail').value = '';
+                    document.getElementById('alertSms').value = '';
+                    document.getElementById('alertCooldown').value = 60;
+                    document.getElementById('alertEnabled').checked = false;
+                }
+            } catch (error) {
+                console.error('Error fetching alert config:', error);
+            }
+        }
+        
+        // Handle Alert Config Form Submission
+        document.getElementById('alertConfigForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const deviceUrn = document.getElementById('alertDeviceUrn').value;
+            const thresholdCpm = parseInt(document.getElementById('thresholdCpm').value);
+            const alertEmail = document.getElementById('alertEmail').value;
+            const alertSms = document.getElementById('alertSms').value;
+            const alertCooldown = parseInt(document.getElementById('alertCooldown').value);
+            const alertEnabled = document.getElementById('alertEnabled').checked;
+            
+            // Validate that at least one notification method is specified if alerts are enabled
+            if (alertEnabled && !alertEmail && !alertSms) {
+                alert('Please provide at least one notification method (email or SMS) to enable alerts.');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/admin/alerts', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        device_urn: deviceUrn,
+                        threshold_cpm: thresholdCpm,
+                        alert_email: alertEmail,
+                        alert_sms: alertSms,
+                        alert_cooldown_minutes: alertCooldown,
+                        alert_enabled: alertEnabled
+                    })
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to save alert configuration');
+                }
+                
+                alert('Alert configuration saved successfully!');
+                closeAlertModal();
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+                console.error('Error:', error);
+            }
+        });
+        
+        // Test Alert Function
+        async function testAlert() {
+            const deviceUrn = document.getElementById('alertDeviceUrn').value;
+            const thresholdCpm = parseInt(document.getElementById('thresholdCpm').value);
+            const alertEmail = document.getElementById('alertEmail').value;
+            const alertSms = document.getElementById('alertSms').value;
+            const alertCooldown = parseInt(document.getElementById('alertCooldown').value || 60);
+            
+            // Validate that at least one notification method is specified
+            if (!alertEmail && !alertSms) {
+                alert('Please provide at least one notification method (email or SMS) to send a test alert.');
+                return;
+            }
+            
+            // Disable button during test
+            const testBtn = document.getElementById('testAlertBtn');
+            const originalBtnText = testBtn.innerHTML;
+            testBtn.disabled = true;
+            testBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Sending Test...';
+            
+            try {
+                const response = await fetch('/api/admin/alerts/test', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        device_urn: deviceUrn,
+                        threshold_cpm: thresholdCpm,
+                        alert_email: alertEmail,
+                        alert_sms: alertSms,
+                        alert_cooldown_minutes: alertCooldown,
+                        alert_enabled: true
+                    })
+                });
+                
+                // Re-enable button
+                testBtn.disabled = false;
+                testBtn.innerHTML = originalBtnText;
+                
+                if (!response.ok) {
+                    const errorText = await response.text();
+                    let errorMessage = 'Failed to send test alert';
+                    
+                    try {
+                        // Try to parse as JSON
+                        const errorObj = JSON.parse(errorText);
+                        errorMessage = errorObj.detail || errorMessage;
+                    } catch (parseError) {
+                        // Not JSON, use text as is if available
+                        errorMessage = errorText || `Error ${response.status}: ${response.statusText}`;
+                    }
+                    
+                    throw new Error(errorMessage);
+                }
+                
+                const result = await response.json();
+                alert(`Test alert sent successfully! ${result.message || ''}`);
+                
+            } catch (error) {
+                // Re-enable button
+                testBtn.disabled = false;
+                testBtn.innerHTML = originalBtnText;
+                
+                console.error('Error sending test alert:', error);
+                alert(`Error: ${error.message || 'Unknown error occurred'}`);
             }
         }
         

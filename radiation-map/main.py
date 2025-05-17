@@ -19,9 +19,14 @@ from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager, asynccontextmanager
 from pathlib import Path
 import requests
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 
 # Import config settings
 from config import MAX_DATA_DAYS, EXTERNAL_HISTORY_URL, DEFAULT_MAP_CENTER, DEFAULT_MAP_ZOOM, AUTO_REFRESH_INTERVAL_SECONDS
+from config import EMAIL_ENABLED, EMAIL_SERVER, EMAIL_PORT, EMAIL_USERNAME, EMAIL_PASSWORD, EMAIL_FROM
+from config import SMS_ENABLED, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -647,6 +652,160 @@ class DeviceCreate(BaseModel):
     device_class: str = "GeigerCounter"
     dev_test: bool = False
 
+# Alert configuration model
+class AlertConfig(BaseModel):
+    device_urn: str
+    threshold_cpm: int
+    alert_email: str = None
+    alert_sms: str = None
+    alert_cooldown_minutes: int = 60
+    alert_enabled: bool = False
+
+# Alert notification functions
+async def send_email_alert(to_email: str, device_urn: str, cpm_value: float, location: str = None):
+    """Send an email alert when radiation levels exceed the threshold."""
+    if not EMAIL_ENABLED:
+        logger.warning("Email alerts are disabled in config. Alert not sent.")
+        return False
+    
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_FROM
+        msg['To'] = to_email
+        msg['Subject'] = f"RADIATION ALERT: High CPM detected on {device_urn}"
+        
+        # Device dashboard link
+        device_id = device_urn.split(':')[-1]
+        dashboard_link = EXTERNAL_HISTORY_URL.format(device_urn=device_id)
+        
+        # Email body
+        body = f"""
+        <html>
+            <body>
+                <h2>⚠️ Radiation Alert</h2>
+                <p>High radiation levels have been detected on device <strong>{device_urn}</strong>.</p>
+                <ul>
+                    <li><strong>Current CPM:</strong> {cpm_value:.1f}</li>
+                    {f"<li><strong>Location:</strong> {location}</li>" if location else ""}
+                    <li><strong>Time:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</li>
+                </ul>
+                <p>Please check the <a href="{dashboard_link}">device dashboard</a> for more information.</p>
+                <p>This is an automated alert from your Radiation Map monitoring system.</p>
+            </body>
+        </html>
+        """
+        
+        msg.attach(MIMEText(body, 'html'))
+        
+        with smtplib.SMTP(EMAIL_SERVER, EMAIL_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+            server.send_message(msg)
+            
+        logger.info(f"Email alert sent to {to_email} for device {device_urn}")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Failed to send email alert: {e}")
+        return False
+
+async def send_sms_alert(to_number: str, device_urn: str, cpm_value: float):
+    """Send an SMS alert when radiation levels exceed the threshold."""
+    if not SMS_ENABLED:
+        logger.warning("SMS alerts are disabled in config. Alert not sent.")
+        return False
+    
+    try:
+        # Import Twilio only if SMS is enabled
+        from twilio.rest import Client
+        
+        # Device ID for dashboard link
+        device_id = device_urn.split(':')[-1]
+        
+        # Message text
+        message_text = f"⚠️ RADIATION ALERT: Device {device_urn} detected {cpm_value:.1f} CPM, exceeding threshold. Check dashboard for details."
+        
+        # Initialize Twilio client
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        
+        # Send SMS
+        message = client.messages.create(
+            body=message_text,
+            from_=TWILIO_FROM_NUMBER,
+            to=to_number
+        )
+        
+        logger.info(f"SMS alert sent to {to_number} for device {device_urn}")
+        return True
+    
+    except ImportError:
+        logger.error("Twilio library not installed. Cannot send SMS alerts.")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to send SMS alert: {e}")
+        return False
+
+# Alert check function - called when new measurements are received
+async def check_and_trigger_alerts(device_urn: str, cpm_value: float, location: str = None):
+    """Check if the CPM value exceeds the threshold and trigger alerts if needed."""
+    try:
+        with get_db() as conn:
+            # Get alert configuration for this device
+            alert_config = conn.execute("""
+                SELECT threshold_cpm, alert_email, alert_sms, alert_enabled, 
+                       last_alert_sent, alert_cooldown_minutes
+                FROM alert_thresholds
+                WHERE device_urn = ?
+            """, (device_urn,)).fetchone()
+            
+            if not alert_config:
+                return  # No alert configured for this device
+            
+            threshold_cpm, alert_email, alert_sms, alert_enabled, last_alert_sent, alert_cooldown = alert_config
+            
+            # Skip if alerts are disabled
+            if not alert_enabled:
+                return
+            
+            # Skip if CPM value doesn't exceed threshold
+            if cpm_value <= threshold_cpm:
+                return
+            
+            # Check cooldown period
+            now = datetime.now(timezone.utc)
+            if last_alert_sent:
+                last_sent_dt = datetime.fromisoformat(last_alert_sent.replace("Z", "+00:00")) if isinstance(last_alert_sent, str) else last_alert_sent
+                cooldown_minutes = timedelta(minutes=alert_cooldown)
+                
+                if now - last_sent_dt < cooldown_minutes:
+                    logger.info(f"Alert for {device_urn} in cooldown period. Skipping.")
+                    return
+            
+            # Update last_alert_sent timestamp
+            conn.execute("""
+                UPDATE alert_thresholds
+                SET last_alert_sent = ?
+                WHERE device_urn = ?
+            """, (now, device_urn))
+            conn.commit()
+            
+            # Send alerts asynchronously
+            notification_tasks = []
+            
+            if alert_email:
+                notification_tasks.append(send_email_alert(alert_email, device_urn, cpm_value, location))
+            
+            if alert_sms:
+                notification_tasks.append(send_sms_alert(alert_sms, device_urn, cpm_value))
+            
+            # Execute all notification tasks
+            if notification_tasks:
+                results = await asyncio.gather(*notification_tasks, return_exceptions=True)
+                logger.info(f"Alert notifications for {device_urn}: {results}")
+    
+    except Exception as e:
+        logger.error(f"Error checking alerts for {device_urn}: {e}")
+
 @app.post("/api/admin/devices")
 async def add_device(device: DeviceCreate):
     """Add a new device."""
@@ -924,6 +1083,26 @@ async def fetch_and_store_device_data(device_urn):
                                 current_values.get('service_transport')
                             ))
                             
+                            # Check for alert thresholds and trigger alerts if needed
+                            location_str = None
+                            try:
+                                transport_info = conn.execute(
+                                    "SELECT city, country FROM transport_info WHERE device_urn = ?", 
+                                    (device_urn,)
+                                ).fetchone()
+                                
+                                if transport_info and transport_info[0] and transport_info[1]:
+                                    location_str = f"{transport_info[0]}, {transport_info[1]}"
+                            except Exception as loc_err:
+                                logger.warning(f"Error getting location for alerts: {loc_err}")
+                            
+                            # Create a background task for alert checking to avoid blocking
+                            asyncio.create_task(check_and_trigger_alerts(
+                                device_urn=device_urn,
+                                cpm_value=radiation_value,
+                                location=location_str
+                            ))
+                            
                             # Now, process the geiger_history array
                             geiger_history = data.get('geiger_history', [])
                             if geiger_history and isinstance(geiger_history, list):
@@ -1107,6 +1286,145 @@ async def cleanup_old_data():
     except Exception as e:
         logger.error(f"Error cleaning up old data: {e}")
         logger.error(traceback.format_exc())
+
+# Alert configuration endpoints
+@app.get("/api/admin/alerts/{device_urn}")
+async def get_alert_config(device_urn: str):
+    """Get alert configuration for a device."""
+    with get_db() as conn:
+        try:
+            # Check if device exists first
+            device = conn.execute("SELECT 1 FROM devices WHERE device_urn = ?", (device_urn,)).fetchone()
+            if not device:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            # Get alert config
+            alert = conn.execute("""
+                SELECT device_urn, threshold_cpm, alert_email, alert_sms, 
+                       alert_enabled, alert_cooldown_minutes
+                FROM alert_thresholds
+                WHERE device_urn = ?
+            """, (device_urn,)).fetchone()
+            
+            if not alert:
+                return JSONResponse(status_code=204, content={})  # No content yet
+            
+            return {
+                "device_urn": alert[0],
+                "threshold_cpm": alert[1],
+                "alert_email": alert[2],
+                "alert_sms": alert[3],
+                "alert_enabled": bool(alert[4]),
+                "alert_cooldown_minutes": alert[5]
+            }
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/admin/alerts")
+async def set_alert_config(alert: AlertConfig):
+    """Set or update alert configuration for a device."""
+    with get_db() as conn:
+        try:
+            # Check if device exists first
+            device = conn.execute("SELECT 1 FROM devices WHERE device_urn = ?", (alert.device_urn,)).fetchone()
+            if not device:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            # Insert or update alert config
+            conn.execute("""
+                INSERT OR REPLACE INTO alert_thresholds
+                (device_urn, threshold_cpm, alert_email, alert_sms, alert_enabled, alert_cooldown_minutes)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                alert.device_urn,
+                alert.threshold_cpm,
+                alert.alert_email,
+                alert.alert_sms,
+                alert.alert_enabled,
+                alert.alert_cooldown_minutes
+            ))
+            
+            conn.commit()
+            return {"message": f"Alert configuration for {alert.device_urn} updated successfully"}
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/admin/alerts/test")
+async def test_alert(alert: AlertConfig):
+    """Send a test alert using the provided configuration."""
+    try:
+        # Check if device exists
+        with get_db() as conn:
+            device = conn.execute("SELECT device_urn, device_id, latitude, longitude FROM devices WHERE device_urn = ?", 
+                                 (alert.device_urn,)).fetchone()
+            
+            if not device:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            # Try to get location information
+            location_str = None
+            try:
+                transport_info = conn.execute(
+                    "SELECT city, country FROM transport_info WHERE device_urn = ?", 
+                    (alert.device_urn,)
+                ).fetchone()
+                
+                if transport_info and transport_info[0] and transport_info[1]:
+                    location_str = f"{transport_info[0]}, {transport_info[1]}"
+            except Exception:
+                pass
+        
+        # Initialize results object
+        results = {"email": None, "sms": None}
+        
+        # Send test notifications
+        if alert.alert_email:
+            try:
+                email_result = await send_email_alert(
+                    to_email=alert.alert_email,
+                    device_urn=alert.device_urn,
+                    cpm_value=alert.threshold_cpm,
+                    location=location_str
+                )
+                results["email"] = "sent successfully" if email_result else "failed to send"
+            except Exception as e:
+                results["email"] = f"error: {str(e)}"
+        
+        if alert.alert_sms:
+            try:
+                sms_result = await send_sms_alert(
+                    to_number=alert.alert_sms,
+                    device_urn=alert.device_urn,
+                    cpm_value=alert.threshold_cpm
+                )
+                results["sms"] = "sent successfully" if sms_result else "failed to send"
+            except Exception as e:
+                results["sms"] = f"error: {str(e)}"
+        
+        # Construct detailed message
+        message_parts = []
+        if alert.alert_email:
+            message_parts.append(f"Email: {results['email']}")
+        if alert.alert_sms:
+            message_parts.append(f"SMS: {results['sms']}")
+        
+        return {
+            "success": True,
+            "message": " | ".join(message_parts)
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error sending test alert: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send test alert: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn

@@ -16,16 +16,76 @@ import traceback
 from typing import List, Dict, Any, Optional, Generator
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 from pathlib import Path
 import requests
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# Import config settings
+from config import MAX_DATA_DAYS, EXTERNAL_HISTORY_URL, DEFAULT_MAP_CENTER, DEFAULT_MAP_ZOOM, AUTO_REFRESH_INTERVAL_SECONDS
+from config import EMAIL_ENABLED, EMAIL_SERVER, EMAIL_PORT, EMAIL_USERNAME, EMAIL_PASSWORD, EMAIL_FROM
+from config import SMS_ENABLED, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Global tasks tracking
+background_task = None
+
+# Lifespan context manager for startup/shutdown events
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Launch periodic data fetch
+    global background_task
+    last_cleanup = datetime.now() - timedelta(days=1)  # Initialize to run cleanup on first cycle
+    
+    async def periodic_data_fetch():
+        """Periodically fetch device data based on config setting"""
+        nonlocal last_cleanup
+        while True:
+            try:
+                logger.info("Running scheduled device data fetch")
+                async with httpx.AsyncClient() as client:
+                    response = await client.get("http://localhost:8000/api/fetch-device-data")
+                    if response.status_code == 200:
+                        logger.info("Scheduled device data fetch started successfully")
+                    else:
+                        logger.error(f"Failed to start scheduled device data fetch: {response.status_code} - {response.text}")
+                
+                # Run cleanup once per day
+                now = datetime.now()
+                if (now - last_cleanup).days >= 1:
+                    logger.info("Running daily data cleanup")
+                    await cleanup_old_data()
+                    last_cleanup = now
+                
+            except Exception as e:
+                logger.error(f"Error during scheduled device data fetch: {e}")
+            
+            # Wait for the configured refresh interval before the next fetch
+            logger.info(f"Waiting {AUTO_REFRESH_INTERVAL_SECONDS} seconds until next data refresh")
+            await asyncio.sleep(AUTO_REFRESH_INTERVAL_SECONDS)
+    
+    # Start the periodic task
+    background_task = asyncio.create_task(periodic_data_fetch())
+    logger.info(f"Started periodic device data fetch task (every {AUTO_REFRESH_INTERVAL_SECONDS} seconds)")
+    
+    yield
+    
+    # Shutdown: Cancel the background task
+    if background_task:
+        logger.info("Cancelling periodic device data fetch task")
+        background_task.cancel()
+        try:
+            await background_task
+        except asyncio.CancelledError:
+            logger.info("Periodic device data fetch task cancelled")
+
 # Initialize FastAPI app
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 # Enable CORS
 app.add_middleware(
@@ -81,7 +141,7 @@ def init_db():
             # Transport_info is also derived.
             # KEEP devices and device_fetch_status data if possible.
             volatile_drop_queries = [
-                "DROP TABLE IF EXISTS measurements",
+                # "DROP TABLE IF EXISTS measurements",  # COMMENTED OUT TO PRESERVE MEASUREMENT DATA BETWEEN RESTARTS
                 # "DROP TABLE IF EXISTS transport_info", # Decide if this needs to be dropped
             ]
             
@@ -163,10 +223,45 @@ def init_db():
                 FOREIGN KEY (device_urn) REFERENCES devices(device_urn)
             )""")
             
-            # Add/Update devices from DEVICE_URNS using INSERT OR IGNORE
-            # This will insert new devices from the list if they don't exist,
-            # but will NOT overwrite existing devices (preserving their fetched lat/lon/etc.)
+            # Create a 'deleted_devices' table to track intentionally removed devices
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS deleted_devices (
+                device_urn VARCHAR PRIMARY KEY,
+                deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+            
+            # Create alert_thresholds table to store alerting configuration
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS alert_thresholds (
+                device_urn VARCHAR PRIMARY KEY,
+                threshold_cpm INTEGER NOT NULL,
+                alert_email VARCHAR,
+                alert_sms VARCHAR,
+                alert_enabled BOOLEAN DEFAULT 0,
+                last_alert_sent TIMESTAMP,
+                alert_cooldown_minutes INTEGER DEFAULT 60,
+                FOREIGN KEY (device_urn) REFERENCES devices(device_urn)
+            )
+            """)
+            
+            # Check which devices have been deleted
+            deleted_devices = set()
+            try:
+                result = conn.execute("SELECT device_urn FROM deleted_devices").fetchall()
+                deleted_devices = {row[0] for row in result}
+                if deleted_devices:
+                    logger.info(f"Found {len(deleted_devices)} previously deleted devices that will not be re-added")
+            except Exception as e:
+                logger.warning(f"Error fetching deleted devices: {e}")
+            
+            # Only add devices that haven't been deleted
             for device_urn in DEVICE_URNS:
+                # Skip if device was previously deleted
+                if device_urn in deleted_devices:
+                    logger.info(f"Skipping device {device_urn} as it was previously deleted")
+                    continue
+                    
                 device_id_str = device_urn.split(':')[-1]
                 device_id = int(device_id_str) if device_id_str.isdigit() else 0
                 
@@ -182,7 +277,7 @@ def init_db():
                     device_id,
                     'GeigerCounter', # Default class
                     False,           # Default dev_test
-                    f'https://safecast.org/tilemap/?y1=90&x1=-180&y2=-90&x2=180&l=0&m=0&sense=1&since=0&until=0&devices={device_id}'
+                    f'https://dashboard.radnote.org/d/cdq671mxg2cjka/radnote-overview?var-device=dev:{device_id}'
                 ))
                 
                 # Initialize fetch status if it doesn't exist using INSERT OR IGNORE
@@ -339,9 +434,19 @@ async def read_root(request: Request):
 async def admin_page(request: Request):
     """Render the admin page for managing devices."""
     with get_db() as conn:
+        # Get active devices
         devices = conn.execute("SELECT device_urn, device_id, device_class, last_seen FROM devices").fetchall()
         devices = [dict(zip(['device_urn', 'device_id', 'device_class', 'last_seen'], d)) for d in devices]
-    return templates.TemplateResponse("admin.html", {"request": request, "devices": devices})
+        
+        # Get deleted devices
+        deleted_devices = conn.execute("SELECT device_urn, deleted_at FROM deleted_devices ORDER BY deleted_at DESC").fetchall()
+        deleted_devices = [dict(zip(['device_urn', 'deleted_at'], d)) for d in deleted_devices]
+        
+    return templates.TemplateResponse("admin.html", {
+        "request": request, 
+        "devices": devices,
+        "deleted_devices": deleted_devices
+    })
 
 @app.get("/api/devices")
 async def get_devices():
@@ -430,7 +535,7 @@ async def get_devices():
         raise HTTPException(status_code=500, detail=error_msg)
 
 @app.get("/api/measurements/{device_urn}")
-async def get_measurements(device_urn: str, days: int = Query(7, gt=0, le=365, description="Number of days of data to return")):
+async def get_measurements(device_urn: str, days: int = Query(default=7, gt=0, le=MAX_DATA_DAYS, description=f"Number of days of data to return (max {MAX_DATA_DAYS} days)")):
     """Get measurements for a specific device over the last N days."""
     try:
         with get_db() as conn:
@@ -447,8 +552,19 @@ async def get_measurements(device_urn: str, days: int = Query(7, gt=0, le=365, d
             end_date = datetime.utcnow()
             start_date = end_date - timedelta(days=days)
             
+            # Add debugging
+            logger.info(f"Fetching measurements for {device_urn} from {start_date.isoformat()} to {end_date.isoformat()}")
+            
+            # Check if any data exists for this device
+            count = conn.execute(
+                "SELECT COUNT(*) FROM measurements WHERE device_urn = ?",
+                (device_urn,)
+            ).fetchone()[0]
+            
+            logger.info(f"Found {count} total measurements for {device_urn}")
+            
             # Get measurements for the device within the date range
-            result = conn.execute("""
+            query = """
                 SELECT 
                     id,
                     device_urn,
@@ -463,7 +579,12 @@ async def get_measurements(device_urn: str, days: int = Query(7, gt=0, le=365, d
                 WHERE device_urn = ? 
                 AND when_captured BETWEEN CAST(? AS TIMESTAMP) AND CAST(? AS TIMESTAMP)
                 ORDER BY when_captured ASC
-            """, (device_urn, start_date.isoformat(), end_date.isoformat()))
+            """
+            
+            # Log the query and parameters for debugging
+            logger.info(f"Executing query: {query} with params: {device_urn}, {start_date.isoformat()}, {end_date.isoformat()}")
+            
+            result = conn.execute(query, (device_urn, start_date.isoformat(), end_date.isoformat()))
             
             # Convert to list of dicts
             measurements = []
@@ -471,13 +592,52 @@ async def get_measurements(device_urn: str, days: int = Query(7, gt=0, le=365, d
             for row in result.fetchall():
                 measurements.append(dict(zip(columns, row)))
             
-            return {"measurements": measurements}
+            logger.info(f"Query returned {len(measurements)} measurements")
+            
+            # If no measurements found within time range, return all measurements for this device (limited to 10)
+            if not measurements:
+                logger.info(f"No measurements found in date range, returning most recent measurements")
+                result = conn.execute("""
+                    SELECT 
+                        id,
+                        device_urn,
+                        when_captured,
+                        lnd_7318u,
+                        latitude,
+                        longitude,
+                        service_uploaded,
+                        service_transport,
+                        recorded_at
+                    FROM measurements
+                    WHERE device_urn = ? 
+                    ORDER BY when_captured DESC
+                    LIMIT 10
+                """, (device_urn,))
+                
+                measurements = []
+                columns = [col[0] for col in result.description] if result.description else []
+                for row in result.fetchall():
+                    measurements.append(dict(zip(columns, row)))
+                
+                logger.info(f"Fallback query returned {len(measurements)} measurements")
+            
+            # Create the external history URL using device_urn
+            external_history_url = None
+            if device_urn:
+                external_history_url = EXTERNAL_HISTORY_URL.format(device_urn=device_urn)
+            
+            return {
+                "measurements": measurements,
+                "max_days": MAX_DATA_DAYS,
+                "external_history_url": external_history_url
+            }
     
     except HTTPException as he:
         raise he
     except Exception as e:
         error_msg = f"Error fetching measurements for device {device_urn}: {str(e)}"
         logger.error(error_msg)
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=error_msg)
 
 # Create necessary directories if they don't exist
@@ -492,6 +652,160 @@ class DeviceCreate(BaseModel):
     device_class: str = "GeigerCounter"
     dev_test: bool = False
 
+# Alert configuration model
+class AlertConfig(BaseModel):
+    device_urn: str
+    threshold_cpm: int
+    alert_email: str = None
+    alert_sms: str = None
+    alert_cooldown_minutes: int = 60
+    alert_enabled: bool = False
+
+# Alert notification functions
+async def send_email_alert(to_email: str, device_urn: str, cpm_value: float, location: str = None):
+    """Send an email alert when radiation levels exceed the threshold."""
+    if not EMAIL_ENABLED:
+        logger.warning("Email alerts are disabled in config. Alert not sent.")
+        return False
+    
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = EMAIL_FROM
+        msg['To'] = to_email
+        msg['Subject'] = f"RADIATION ALERT: High CPM detected on {device_urn}"
+        
+        # Device dashboard link
+        device_id = device_urn.split(':')[-1]
+        dashboard_link = EXTERNAL_HISTORY_URL.format(device_urn=device_id)
+        
+        # Email body
+        body = f"""
+        <html>
+            <body>
+                <h2>⚠️ Radiation Alert</h2>
+                <p>High radiation levels have been detected on device <strong>{device_urn}</strong>.</p>
+                <ul>
+                    <li><strong>Current CPM:</strong> {cpm_value:.1f}</li>
+                    {f"<li><strong>Location:</strong> {location}</li>" if location else ""}
+                    <li><strong>Time:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}</li>
+                </ul>
+                <p>Please check the <a href="{dashboard_link}">device dashboard</a> for more information.</p>
+                <p>This is an automated alert from your Radiation Map monitoring system.</p>
+            </body>
+        </html>
+        """
+        
+        msg.attach(MIMEText(body, 'html'))
+        
+        with smtplib.SMTP(EMAIL_SERVER, EMAIL_PORT) as server:
+            server.starttls()
+            server.login(EMAIL_USERNAME, EMAIL_PASSWORD)
+            server.send_message(msg)
+            
+        logger.info(f"Email alert sent to {to_email} for device {device_urn}")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Failed to send email alert: {e}")
+        return False
+
+async def send_sms_alert(to_number: str, device_urn: str, cpm_value: float):
+    """Send an SMS alert when radiation levels exceed the threshold."""
+    if not SMS_ENABLED:
+        logger.warning("SMS alerts are disabled in config. Alert not sent.")
+        return False
+    
+    try:
+        # Import Twilio only if SMS is enabled
+        from twilio.rest import Client
+        
+        # Device ID for dashboard link
+        device_id = device_urn.split(':')[-1]
+        
+        # Message text
+        message_text = f"⚠️ RADIATION ALERT: Device {device_urn} detected {cpm_value:.1f} CPM, exceeding threshold. Check dashboard for details."
+        
+        # Initialize Twilio client
+        client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+        
+        # Send SMS
+        message = client.messages.create(
+            body=message_text,
+            from_=TWILIO_FROM_NUMBER,
+            to=to_number
+        )
+        
+        logger.info(f"SMS alert sent to {to_number} for device {device_urn}")
+        return True
+    
+    except ImportError:
+        logger.error("Twilio library not installed. Cannot send SMS alerts.")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to send SMS alert: {e}")
+        return False
+
+# Alert check function - called when new measurements are received
+async def check_and_trigger_alerts(device_urn: str, cpm_value: float, location: str = None):
+    """Check if the CPM value exceeds the threshold and trigger alerts if needed."""
+    try:
+        with get_db() as conn:
+            # Get alert configuration for this device
+            alert_config = conn.execute("""
+                SELECT threshold_cpm, alert_email, alert_sms, alert_enabled, 
+                       last_alert_sent, alert_cooldown_minutes
+                FROM alert_thresholds
+                WHERE device_urn = ?
+            """, (device_urn,)).fetchone()
+            
+            if not alert_config:
+                return  # No alert configured for this device
+            
+            threshold_cpm, alert_email, alert_sms, alert_enabled, last_alert_sent, alert_cooldown = alert_config
+            
+            # Skip if alerts are disabled
+            if not alert_enabled:
+                return
+            
+            # Skip if CPM value doesn't exceed threshold
+            if cpm_value <= threshold_cpm:
+                return
+            
+            # Check cooldown period
+            now = datetime.now(timezone.utc)
+            if last_alert_sent:
+                last_sent_dt = datetime.fromisoformat(last_alert_sent.replace("Z", "+00:00")) if isinstance(last_alert_sent, str) else last_alert_sent
+                cooldown_minutes = timedelta(minutes=alert_cooldown)
+                
+                if now - last_sent_dt < cooldown_minutes:
+                    logger.info(f"Alert for {device_urn} in cooldown period. Skipping.")
+                    return
+            
+            # Update last_alert_sent timestamp
+            conn.execute("""
+                UPDATE alert_thresholds
+                SET last_alert_sent = ?
+                WHERE device_urn = ?
+            """, (now, device_urn))
+            conn.commit()
+            
+            # Send alerts asynchronously
+            notification_tasks = []
+            
+            if alert_email:
+                notification_tasks.append(send_email_alert(alert_email, device_urn, cpm_value, location))
+            
+            if alert_sms:
+                notification_tasks.append(send_sms_alert(alert_sms, device_urn, cpm_value))
+            
+            # Execute all notification tasks
+            if notification_tasks:
+                results = await asyncio.gather(*notification_tasks, return_exceptions=True)
+                logger.info(f"Alert notifications for {device_urn}: {results}")
+    
+    except Exception as e:
+        logger.error(f"Error checking alerts for {device_urn}: {e}")
+
 @app.post("/api/admin/devices")
 async def add_device(device: DeviceCreate):
     """Add a new device."""
@@ -505,7 +819,7 @@ async def add_device(device: DeviceCreate):
                 device.device_id,
                 device.device_class,
                 device.dev_test,
-                f'https://safecast.org/tilemap/?y1=90&x1=-180&y2=-90&x2=180&l=0&m=0&sense=1&since=0&until=0&devices={device.device_id}'
+                f'https://dashboard.radnote.org/d/cdq671mxg2cjka/radnote-overview?var-device=dev:{device.device_id}'
             ))
             
             # Initialize fetch status
@@ -527,12 +841,70 @@ async def remove_device(device_urn: str):
         try:
             # Delete from device_fetch_status first due to foreign key constraint
             conn.execute("DELETE FROM device_fetch_status WHERE device_urn = ?", (device_urn,))
+            
+            # Delete the device
             result = conn.execute("DELETE FROM devices WHERE device_urn = ? RETURNING device_urn", (device_urn,))
             deleted = result.fetchone()
             if not deleted:
                 raise HTTPException(status_code=404, detail="Device not found")
+                
+            # Add to deleted_devices table to prevent re-addition on server restart
+            conn.execute(
+                "INSERT OR REPLACE INTO deleted_devices (device_urn, deleted_at) VALUES (?, CURRENT_TIMESTAMP)",
+                (device_urn,)
+            )
+            
             conn.commit()
+            logger.info(f"Device {device_urn} removed and added to deleted_devices list")
             return {"message": f"Device {device_urn} removed successfully"}
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/admin/devices/restore/{device_urn}")
+async def restore_device(device_urn: str):
+    """Restore a previously deleted device."""
+    with get_db() as conn:
+        try:
+            # Check if the device is in the deleted_devices table
+            deleted = conn.execute("SELECT 1 FROM deleted_devices WHERE device_urn = ?", (device_urn,)).fetchone()
+            if not deleted:
+                raise HTTPException(status_code=404, detail="Device not found in deleted devices list")
+            
+            # Remove from deleted_devices table
+            conn.execute("DELETE FROM deleted_devices WHERE device_urn = ?", (device_urn,))
+            
+            # Initialize the device if it's in DEVICE_URNS
+            if device_urn in DEVICE_URNS:
+                device_id_str = device_urn.split(':')[-1]
+                device_id = int(device_id_str) if device_id_str.isdigit() else 0
+                
+                # Add the device
+                conn.execute("""
+                    INSERT OR IGNORE INTO devices (
+                        device_urn, device_id, device_class, dev_test, dev_dashboard
+                    ) VALUES (?, ?, ?, ?, ?)
+                """, (
+                    device_urn,
+                    device_id,
+                    'GeigerCounter', # Default class
+                    False,           # Default dev_test
+                    f'https://dashboard.radnote.org/d/cdq671mxg2cjka/radnote-overview?var-device=dev:{device_id}'
+                ))
+                
+                # Initialize fetch status
+                conn.execute("""
+                    INSERT OR IGNORE INTO device_fetch_status (device_urn, fetch_status)
+                    VALUES (?, 'pending')
+                """, (device_urn,))
+                
+                conn.commit()
+                logger.info(f"Device {device_urn} restored successfully")
+                return {"message": f"Device {device_urn} restored successfully"}
+            else:
+                raise HTTPException(status_code=400, detail=f"Device {device_urn} is not in the configured device list")
+        except HTTPException:
+            raise
         except Exception as e:
             conn.rollback()
             raise HTTPException(status_code=400, detail=str(e))
@@ -695,10 +1067,97 @@ async def fetch_and_store_device_data(device_urn):
                                 (latitude, longitude, last_seen_dt, radiation_value, device_urn)
                             )
                             
-                            # For simplicity, we are not inserting into 'measurements' table here.
-                            # If historical tracking per reading is needed, that logic would go here,
-                            # potentially checking if this exact reading (by timestamp) already exists.
-                            # For now, we just update the 'devices' table with the latest.
+                            # Insert the current reading into measurements table if it doesn't exist
+                            conn.execute("""
+                                INSERT OR IGNORE INTO measurements (
+                                    device_urn, when_captured, lnd_7318u, latitude, longitude, 
+                                    service_uploaded, service_transport
+                                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            """, (
+                                device_urn,
+                                last_seen_dt,
+                                radiation_value,
+                                latitude,
+                                longitude,
+                                current_values.get('service_uploaded'),
+                                current_values.get('service_transport')
+                            ))
+                            
+                            # Check for alert thresholds and trigger alerts if needed
+                            location_str = None
+                            try:
+                                transport_info = conn.execute(
+                                    "SELECT city, country FROM transport_info WHERE device_urn = ?", 
+                                    (device_urn,)
+                                ).fetchone()
+                                
+                                if transport_info and transport_info[0] and transport_info[1]:
+                                    location_str = f"{transport_info[0]}, {transport_info[1]}"
+                            except Exception as loc_err:
+                                logger.warning(f"Error getting location for alerts: {loc_err}")
+                            
+                            # Create a background task for alert checking to avoid blocking
+                            asyncio.create_task(check_and_trigger_alerts(
+                                device_urn=device_urn,
+                                cpm_value=radiation_value,
+                                location=location_str
+                            ))
+                            
+                            # Now, process the geiger_history array
+                            geiger_history = data.get('geiger_history', [])
+                            if geiger_history and isinstance(geiger_history, list):
+                                logger.info(f"Processing {len(geiger_history)} geiger_history entries for {device_urn}")
+                                entries_inserted = 0
+                                
+                                for entry in geiger_history:
+                                    try:
+                                        # Only process valid entries
+                                        if not isinstance(entry, dict):
+                                            continue
+                                            
+                                        entry_when_captured = entry.get('when_captured')
+                                        entry_reading = entry.get('lnd_7318u')
+                                        entry_lat = entry.get('loc_lat')
+                                        entry_lon = entry.get('loc_lon')
+                                        
+                                        if not (entry_when_captured and entry_reading):
+                                            continue
+                                            
+                                        # Convert values to appropriate types
+                                        try:
+                                            entry_reading = float(entry_reading)
+                                            entry_dt = datetime.fromisoformat(entry_when_captured.replace("Z", "+00:00"))
+                                            entry_lat = float(entry_lat) if entry_lat is not None else None
+                                            entry_lon = float(entry_lon) if entry_lon is not None else None
+                                        except (ValueError, TypeError) as ve:
+                                            logger.warning(f"Value conversion error for history entry: {ve}")
+                                            continue
+                                            
+                                        # Insert the historical reading
+                                        conn.execute("""
+                                            INSERT OR IGNORE INTO measurements (
+                                                device_urn, when_captured, lnd_7318u, latitude, longitude,
+                                                service_uploaded, service_transport
+                                            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                                        """, (
+                                            device_urn,
+                                            entry_dt,
+                                            entry_reading,
+                                            entry_lat,
+                                            entry_lon,
+                                            entry.get('service_uploaded'),
+                                            entry.get('service_transport')
+                                        ))
+                                        entries_inserted += 1
+                                        
+                                    except Exception as entry_error:
+                                        logger.warning(f"Error processing history entry: {entry_error}")
+                                        continue
+                                
+                                logger.info(f"Inserted {entries_inserted} historical entries for {device_urn}")
+                            else:
+                                logger.info(f"No valid geiger_history found for {device_urn}")
+                            
                             logger.info(f"Updated device {device_urn} with: lat={latitude}, lon={longitude}, reading={radiation_value}, seen={last_seen_dt}")
                             conn.commit()
                         fetch_status = "completed" 
@@ -784,12 +1243,199 @@ async def fetch_and_store_device_data(device_urn):
 # Create static directories if they don't exist
 os.makedirs("static/js", exist_ok=True)
 
+async def startup_tasks():
+    """Run startup tasks like initial data fetch"""
+    try:
+        # Wait a few seconds to let the server fully start
+        await asyncio.sleep(3)
+        
+        # Trigger data fetch for all devices
+        logger.info("Running initial device data fetch at startup")
+        async with httpx.AsyncClient() as client:
+            response = await client.get("http://localhost:8000/api/fetch-device-data")
+            if response.status_code == 200:
+                logger.info("Initial device data fetch started successfully")
+            else:
+                logger.error(f"Failed to start initial device data fetch: {response.status_code} - {response.text}")
+    except Exception as e:
+        logger.error(f"Error running startup tasks: {e}")
+
+async def cleanup_old_data():
+    """Remove measurement data older than MAX_DATA_DAYS to keep the database size manageable."""
+    try:
+        with get_db(raise_http_exception=False) as conn:
+            # Calculate the cutoff date
+            cutoff_date = (datetime.utcnow() - timedelta(days=MAX_DATA_DAYS)).isoformat()
+            
+            # Get count of records to be deleted
+            count = conn.execute(
+                "SELECT COUNT(*) FROM measurements WHERE when_captured < CAST(? AS TIMESTAMP)",
+                (cutoff_date,)
+            ).fetchone()[0]
+            
+            if count > 0:
+                # Delete old records
+                conn.execute(
+                    "DELETE FROM measurements WHERE when_captured < CAST(? AS TIMESTAMP)",
+                    (cutoff_date,)
+                )
+                conn.commit()
+                logger.info(f"Deleted {count} measurement records older than {MAX_DATA_DAYS} days")
+            else:
+                logger.info(f"No measurement records older than {MAX_DATA_DAYS} days to delete")
+    except Exception as e:
+        logger.error(f"Error cleaning up old data: {e}")
+        logger.error(traceback.format_exc())
+
+# Alert configuration endpoints
+@app.get("/api/admin/alerts/{device_urn}")
+async def get_alert_config(device_urn: str):
+    """Get alert configuration for a device."""
+    with get_db() as conn:
+        try:
+            # Check if device exists first
+            device = conn.execute("SELECT 1 FROM devices WHERE device_urn = ?", (device_urn,)).fetchone()
+            if not device:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            # Get alert config
+            alert = conn.execute("""
+                SELECT device_urn, threshold_cpm, alert_email, alert_sms, 
+                       alert_enabled, alert_cooldown_minutes
+                FROM alert_thresholds
+                WHERE device_urn = ?
+            """, (device_urn,)).fetchone()
+            
+            if not alert:
+                return JSONResponse(status_code=204, content={})  # No content yet
+            
+            return {
+                "device_urn": alert[0],
+                "threshold_cpm": alert[1],
+                "alert_email": alert[2],
+                "alert_sms": alert[3],
+                "alert_enabled": bool(alert[4]),
+                "alert_cooldown_minutes": alert[5]
+            }
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/admin/alerts")
+async def set_alert_config(alert: AlertConfig):
+    """Set or update alert configuration for a device."""
+    with get_db() as conn:
+        try:
+            # Check if device exists first
+            device = conn.execute("SELECT 1 FROM devices WHERE device_urn = ?", (alert.device_urn,)).fetchone()
+            if not device:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            # Insert or update alert config
+            conn.execute("""
+                INSERT OR REPLACE INTO alert_thresholds
+                (device_urn, threshold_cpm, alert_email, alert_sms, alert_enabled, alert_cooldown_minutes)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                alert.device_urn,
+                alert.threshold_cpm,
+                alert.alert_email,
+                alert.alert_sms,
+                alert.alert_enabled,
+                alert.alert_cooldown_minutes
+            ))
+            
+            conn.commit()
+            return {"message": f"Alert configuration for {alert.device_urn} updated successfully"}
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/admin/alerts/test")
+async def test_alert(alert: AlertConfig):
+    """Send a test alert using the provided configuration."""
+    try:
+        # Check if device exists
+        with get_db() as conn:
+            device = conn.execute("SELECT device_urn, device_id, latitude, longitude FROM devices WHERE device_urn = ?", 
+                                 (alert.device_urn,)).fetchone()
+            
+            if not device:
+                raise HTTPException(status_code=404, detail="Device not found")
+            
+            # Try to get location information
+            location_str = None
+            try:
+                transport_info = conn.execute(
+                    "SELECT city, country FROM transport_info WHERE device_urn = ?", 
+                    (alert.device_urn,)
+                ).fetchone()
+                
+                if transport_info and transport_info[0] and transport_info[1]:
+                    location_str = f"{transport_info[0]}, {transport_info[1]}"
+            except Exception:
+                pass
+        
+        # Initialize results object
+        results = {"email": None, "sms": None}
+        
+        # Send test notifications
+        if alert.alert_email:
+            try:
+                email_result = await send_email_alert(
+                    to_email=alert.alert_email,
+                    device_urn=alert.device_urn,
+                    cpm_value=alert.threshold_cpm,
+                    location=location_str
+                )
+                results["email"] = "sent successfully" if email_result else "failed to send"
+            except Exception as e:
+                results["email"] = f"error: {str(e)}"
+        
+        if alert.alert_sms:
+            try:
+                sms_result = await send_sms_alert(
+                    to_number=alert.alert_sms,
+                    device_urn=alert.device_urn,
+                    cpm_value=alert.threshold_cpm
+                )
+                results["sms"] = "sent successfully" if sms_result else "failed to send"
+            except Exception as e:
+                results["sms"] = f"error: {str(e)}"
+        
+        # Construct detailed message
+        message_parts = []
+        if alert.alert_email:
+            message_parts.append(f"Email: {results['email']}")
+        if alert.alert_sms:
+            message_parts.append(f"SMS: {results['sms']}")
+        
+        return {
+            "success": True,
+            "message": " | ".join(message_parts)
+        }
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error sending test alert: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to send test alert: {str(e)}")
+
 if __name__ == "__main__":
     import uvicorn
     
     try:
         # Initialize database
         init_db()
+        
+        # Schedule startup tasks to run after server starts
+        background_tasks = BackgroundTasks()
+        background_tasks.add_task(startup_tasks)
         
         # Run the server
         uvicorn.run(

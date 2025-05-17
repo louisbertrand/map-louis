@@ -73,27 +73,27 @@ def get_db(raise_http_exception: bool = True) -> Generator[duckdb.DuckDBPyConnec
             conn.close()
 
 def init_db():
-    """Initialize the database with required tables."""
+    """Initialize the database with required tables. Makes an effort to preserve existing device data."""
     with get_db(raise_http_exception=False) as conn:
         try:
-            # Drop and recreate tables to ensure clean state
-            drop_queries = [
+            # Drop tables that are purely for volatile/historical data or less critical to preserve across restarts
+            # Measurements are fetched from API, so can be rebuilt.
+            # Transport_info is also derived.
+            # KEEP devices and device_fetch_status data if possible.
+            volatile_drop_queries = [
                 "DROP TABLE IF EXISTS measurements",
-                "DROP TABLE IF EXISTS device_fetch_status",
-                "DROP TABLE IF EXISTS devices",
-                "DROP TABLE IF EXISTS transport_info",
+                # "DROP TABLE IF EXISTS transport_info", # Decide if this needs to be dropped
             ]
             
-            for query in drop_queries:
+            for query in volatile_drop_queries:
                 try:
                     conn.execute(query)
                 except Exception as e:
-                    logger.warning(f"Error dropping table: {e}")
+                    logger.warning(f"Warning dropping table {query.split()[-1]}: {e}")
             
-            # Commit after dropping tables
-            conn.commit()
+            conn.commit() # Commit drops of volatile tables
             
-            # Create devices table
+            # Create devices table - IF NOT EXISTS
             conn.execute("""
             CREATE TABLE IF NOT EXISTS devices (
                 device_urn VARCHAR PRIMARY KEY,
@@ -111,7 +111,7 @@ def init_db():
                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
             
-            # Create measurements table
+            # Create measurements table - IF NOT EXISTS (though we drop it above, good practice)
             conn.execute("""
             CREATE SEQUENCE IF NOT EXISTS measurements_id_seq;
             
@@ -128,7 +128,7 @@ def init_db():
                 UNIQUE(device_urn, when_captured, lnd_7318u)
             )""")
             
-            # Create device_fetch_status table
+            # Create device_fetch_status table - IF NOT EXISTS
             conn.execute("""
             CREATE TABLE IF NOT EXISTS device_fetch_status (
                 device_urn TEXT PRIMARY KEY,
@@ -139,45 +139,76 @@ def init_db():
                 error_message TEXT,
                 FOREIGN KEY (device_urn) REFERENCES devices(device_urn)
             )""")
+
+            # Create transport_info table - IF NOT EXISTS
+            # If you choose not to drop transport_info above, this ensures it's created.
+            # If it contains data linked to devices that should persist, don't drop it.
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS transport_info (
+                device_urn TEXT PRIMARY KEY,
+                query_ip TEXT,
+                status TEXT,
+                as_info TEXT,
+                city TEXT,
+                country TEXT,
+                country_code TEXT,
+                isp TEXT,
+                latitude REAL,
+                longitude REAL,
+                org TEXT,
+                region TEXT,
+                region_name TEXT,
+                timezone TEXT,
+                zip_code TEXT,
+                FOREIGN KEY (device_urn) REFERENCES devices(device_urn)
+            )""")
             
-            # Add all devices
+            # Add/Update devices from DEVICE_URNS using INSERT OR IGNORE
+            # This will insert new devices from the list if they don't exist,
+            # but will NOT overwrite existing devices (preserving their fetched lat/lon/etc.)
             for device_urn in DEVICE_URNS:
-                device_id = device_urn.split(':')[-1]  # Extract device ID from URN
+                device_id_str = device_urn.split(':')[-1]
+                device_id = int(device_id_str) if device_id_str.isdigit() else 0
                 
-                # Add the device if it doesn't exist
+                # Add the device if it doesn't exist. 
+                # We only set core identifying info and defaults here.
+                # Other fields like lat, lon, last_reading are populated by fetch_and_store_device_data
                 conn.execute("""
                     INSERT OR IGNORE INTO devices (
                         device_urn, device_id, device_class, dev_test, dev_dashboard
                     ) VALUES (?, ?, ?, ?, ?)
                 """, (
                     device_urn,
-                    int(device_id) if device_id.isdigit() else 0,  # Convert to int if possible
-                    'GeigerCounter',
-                    False,
+                    device_id,
+                    'GeigerCounter', # Default class
+                    False,           # Default dev_test
                     f'https://safecast.org/tilemap/?y1=90&x1=-180&y2=-90&x2=180&l=0&m=0&sense=1&since=0&until=0&devices={device_id}'
                 ))
                 
-                # Initialize fetch status if it doesn't exist
+                # Initialize fetch status if it doesn't exist using INSERT OR IGNORE
                 conn.execute("""
-                    INSERT OR IGNORE INTO device_fetch_status (device_urn, last_fetched, fetch_status)
-                    VALUES (?, NULL, 'pending')
+                    INSERT OR IGNORE INTO device_fetch_status (device_urn, fetch_status)
+                    VALUES (?, 'pending')
                 """, (device_urn,))
             
             # Create indexes for better query performance
             conn.execute("CREATE INDEX IF NOT EXISTS idx_measurements_device_urn ON measurements(device_urn)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_measurements_when_captured ON measurements(when_captured)")
-            
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_devices_device_id ON devices(device_id)") # Index for device_id
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_transport_info_device_urn ON transport_info(device_urn)")
+
             conn.commit()
-            logger.info("Database initialized successfully")
+            logger.info("Database initialized (non-destructive for existing device data).")
             
         except Exception as e:
             try:
-                conn.rollback()
-            except:
-                pass
+                conn.rollback() # Attempt to rollback on error during init
+            except Exception as rb_exc:
+                logger.error(f"Rollback failed during init_db error handling: {rb_exc}")
             logger.error(f"Error initializing database: {e}")
             logger.error(traceback.format_exc())
-            raise
+            # Depending on severity, you might want to re-raise or exit if DB init is critical and fails
+            raise # Re-raise the exception to make it visible if startup should halt
 
 # Initialize the database when the application starts
 init_db()

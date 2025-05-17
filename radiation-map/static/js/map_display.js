@@ -25,7 +25,7 @@ async function initMap() {
             }
             
             // Create a green circular marker with sensor value
-            const reading = Math.round((sensor.last_reading || 0) * 17.5); // Convert to CPM
+            const reading = Math.round(sensor.last_reading || 0);
             const marker = L.circleMarker([sensor.latitude, sensor.longitude], {
                 radius: 15,
                 fillColor: '#2ecc71',
@@ -43,12 +43,13 @@ async function initMap() {
                 iconAnchor: [15, 15]
             });
             
-            L.marker([sensor.latitude, sensor.longitude], { icon: icon }).addTo(map);
+            // Make this marker non-interactive
+            L.marker([sensor.latitude, sensor.longitude], { icon: icon, interactive: false }).addTo(map);
             
             // Get the sensor ID for display
             const sensorId = sensor.device_id || sensor.device_urn.split(':').pop();
             
-            // Create popup with graph for sensor data
+            // Restore original popup with graph placeholder
             marker.bindPopup(`
                 <div style="width: 300px;">
                     <h3>Sensor ${sensorId}</h3>
@@ -56,10 +57,14 @@ async function initMap() {
                 </div>
             `);
             
+            // Remove the temporary basic click listener
+            // marker.on('click', function(e) { ... }); // This line will be deleted
+
+            // Restore original popupopen event for graph creation
             marker.on('popupopen', function() {
                 setTimeout(() => {
                     createSimpleGraph(sensor.device_urn, `popup-graph-${sensorId}`);
-                }, 100);
+                }, 100); // 100ms delay to ensure popup is in DOM
             });
             
             marker.sensorId = sensor.device_urn;
@@ -92,7 +97,7 @@ async function createSimpleGraph(sensorId, containerId) {
         const ctx = canvas.getContext('2d');
         
         // Draw simple graph
-        const values = measurements.map(m => m.lnd_7318u * 17.5); // Convert to CPM
+        const values = measurements.map(m => m.lnd_7318u);
         const maxValue = Math.max(...values, 40); // Ensure at least 0-40 range
         
         // Draw axes

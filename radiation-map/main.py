@@ -218,10 +218,45 @@ def init_db():
                 FOREIGN KEY (device_urn) REFERENCES devices(device_urn)
             )""")
             
-            # Add/Update devices from DEVICE_URNS using INSERT OR IGNORE
-            # This will insert new devices from the list if they don't exist,
-            # but will NOT overwrite existing devices (preserving their fetched lat/lon/etc.)
+            # Create a 'deleted_devices' table to track intentionally removed devices
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS deleted_devices (
+                device_urn VARCHAR PRIMARY KEY,
+                deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
+            
+            # Create alert_thresholds table to store alerting configuration
+            conn.execute("""
+            CREATE TABLE IF NOT EXISTS alert_thresholds (
+                device_urn VARCHAR PRIMARY KEY,
+                threshold_cpm INTEGER NOT NULL,
+                alert_email VARCHAR,
+                alert_sms VARCHAR,
+                alert_enabled BOOLEAN DEFAULT 0,
+                last_alert_sent TIMESTAMP,
+                alert_cooldown_minutes INTEGER DEFAULT 60,
+                FOREIGN KEY (device_urn) REFERENCES devices(device_urn)
+            )
+            """)
+            
+            # Check which devices have been deleted
+            deleted_devices = set()
+            try:
+                result = conn.execute("SELECT device_urn FROM deleted_devices").fetchall()
+                deleted_devices = {row[0] for row in result}
+                if deleted_devices:
+                    logger.info(f"Found {len(deleted_devices)} previously deleted devices that will not be re-added")
+            except Exception as e:
+                logger.warning(f"Error fetching deleted devices: {e}")
+            
+            # Only add devices that haven't been deleted
             for device_urn in DEVICE_URNS:
+                # Skip if device was previously deleted
+                if device_urn in deleted_devices:
+                    logger.info(f"Skipping device {device_urn} as it was previously deleted")
+                    continue
+                    
                 device_id_str = device_urn.split(':')[-1]
                 device_id = int(device_id_str) if device_id_str.isdigit() else 0
                 
@@ -394,9 +429,19 @@ async def read_root(request: Request):
 async def admin_page(request: Request):
     """Render the admin page for managing devices."""
     with get_db() as conn:
+        # Get active devices
         devices = conn.execute("SELECT device_urn, device_id, device_class, last_seen FROM devices").fetchall()
         devices = [dict(zip(['device_urn', 'device_id', 'device_class', 'last_seen'], d)) for d in devices]
-    return templates.TemplateResponse("admin.html", {"request": request, "devices": devices})
+        
+        # Get deleted devices
+        deleted_devices = conn.execute("SELECT device_urn, deleted_at FROM deleted_devices ORDER BY deleted_at DESC").fetchall()
+        deleted_devices = [dict(zip(['device_urn', 'deleted_at'], d)) for d in deleted_devices]
+        
+    return templates.TemplateResponse("admin.html", {
+        "request": request, 
+        "devices": devices,
+        "deleted_devices": deleted_devices
+    })
 
 @app.get("/api/devices")
 async def get_devices():
@@ -637,12 +682,70 @@ async def remove_device(device_urn: str):
         try:
             # Delete from device_fetch_status first due to foreign key constraint
             conn.execute("DELETE FROM device_fetch_status WHERE device_urn = ?", (device_urn,))
+            
+            # Delete the device
             result = conn.execute("DELETE FROM devices WHERE device_urn = ? RETURNING device_urn", (device_urn,))
             deleted = result.fetchone()
             if not deleted:
                 raise HTTPException(status_code=404, detail="Device not found")
+                
+            # Add to deleted_devices table to prevent re-addition on server restart
+            conn.execute(
+                "INSERT OR REPLACE INTO deleted_devices (device_urn, deleted_at) VALUES (?, CURRENT_TIMESTAMP)",
+                (device_urn,)
+            )
+            
             conn.commit()
+            logger.info(f"Device {device_urn} removed and added to deleted_devices list")
             return {"message": f"Device {device_urn} removed successfully"}
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
+
+@app.post("/api/admin/devices/restore/{device_urn}")
+async def restore_device(device_urn: str):
+    """Restore a previously deleted device."""
+    with get_db() as conn:
+        try:
+            # Check if the device is in the deleted_devices table
+            deleted = conn.execute("SELECT 1 FROM deleted_devices WHERE device_urn = ?", (device_urn,)).fetchone()
+            if not deleted:
+                raise HTTPException(status_code=404, detail="Device not found in deleted devices list")
+            
+            # Remove from deleted_devices table
+            conn.execute("DELETE FROM deleted_devices WHERE device_urn = ?", (device_urn,))
+            
+            # Initialize the device if it's in DEVICE_URNS
+            if device_urn in DEVICE_URNS:
+                device_id_str = device_urn.split(':')[-1]
+                device_id = int(device_id_str) if device_id_str.isdigit() else 0
+                
+                # Add the device
+                conn.execute("""
+                    INSERT OR IGNORE INTO devices (
+                        device_urn, device_id, device_class, dev_test, dev_dashboard
+                    ) VALUES (?, ?, ?, ?, ?)
+                """, (
+                    device_urn,
+                    device_id,
+                    'GeigerCounter', # Default class
+                    False,           # Default dev_test
+                    f'https://dashboard.radnote.org/d/cdq671mxg2cjka/radnote-overview?var-device=dev:{device_id}'
+                ))
+                
+                # Initialize fetch status
+                conn.execute("""
+                    INSERT OR IGNORE INTO device_fetch_status (device_urn, fetch_status)
+                    VALUES (?, 'pending')
+                """, (device_urn,))
+                
+                conn.commit()
+                logger.info(f"Device {device_urn} restored successfully")
+                return {"message": f"Device {device_urn} restored successfully"}
+            else:
+                raise HTTPException(status_code=400, detail=f"Device {device_urn} is not in the configured device list")
+        except HTTPException:
+            raise
         except Exception as e:
             conn.rollback()
             raise HTTPException(status_code=400, detail=str(e))

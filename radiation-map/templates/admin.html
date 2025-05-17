@@ -11,6 +11,18 @@
     <div class="container mx-auto px-4 py-8">
         <h1 class="text-3xl font-bold mb-8 text-gray-800">Device Management</h1>
         
+        <!-- Data Refresh Button -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+            <div class="flex justify-between items-center">
+                <h2 class="text-xl font-semibold">Data Management</h2>
+                <button id="refreshDataBtn" 
+                        class="px-4 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-green-500">
+                    <i class="fas fa-sync-alt mr-2"></i> Refresh All Device Data
+                </button>
+            </div>
+            <p class="text-sm text-gray-600 mt-2">Last refresh: <span id="lastRefreshTime">Never</span></p>
+        </div>
+        
         <!-- Add Device Form -->
         <div class="bg-white rounded-lg shadow-md p-6 mb-8">
             <h2 class="text-xl font-semibold mb-4">Add New Device</h2>
@@ -129,6 +141,49 @@
                 console.error('Error:', error);
             }
         }
+        
+        // Handle Refresh Data button
+        document.getElementById('refreshDataBtn').addEventListener('click', async () => {
+            try {
+                // Disable button during refresh
+                const refreshBtn = document.getElementById('refreshDataBtn');
+                refreshBtn.disabled = true;
+                refreshBtn.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i> Refreshing...';
+                
+                const response = await fetch('/api/fetch-device-data');
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to refresh device data');
+                }
+                
+                const result = await response.json();
+                
+                // Show success message and update last refresh time
+                const now = new Date().toLocaleString();
+                document.getElementById('lastRefreshTime').innerText = now;
+                
+                // Re-enable button
+                refreshBtn.disabled = false;
+                refreshBtn.innerHTML = '<i class="fas fa-sync-alt mr-2"></i> Refresh All Device Data';
+                
+                alert(`Successfully started data refresh: ${result.message}`);
+                
+                // Reload the page after a short delay to show updated data
+                setTimeout(() => {
+                    window.location.reload();
+                }, 5000);
+                
+            } catch (error) {
+                alert(`Error refreshing device data: ${error.message}`);
+                console.error('Error:', error);
+                
+                // Re-enable button on error
+                const refreshBtn = document.getElementById('refreshDataBtn');
+                refreshBtn.disabled = false;
+                refreshBtn.innerHTML = '<i class="fas fa-sync-alt mr-2"></i> Refresh All Device Data';
+            }
+        });
     </script>
 </body>
 </html>

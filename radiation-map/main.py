@@ -16,7 +16,7 @@ import traceback
 from typing import List, Dict, Any, Optional, Generator
 from pydantic import BaseModel
 from datetime import datetime, timedelta, timezone
-from contextlib import contextmanager
+from contextlib import contextmanager, asynccontextmanager
 from pathlib import Path
 import requests
 
@@ -24,8 +24,49 @@ import requests
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Global tasks tracking
+background_task = None
+
+# Lifespan context manager for startup/shutdown events
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: Launch periodic data fetch
+    global background_task
+    
+    async def periodic_data_fetch():
+        """Periodically fetch device data every hour"""
+        while True:
+            try:
+                logger.info("Running scheduled device data fetch")
+                async with httpx.AsyncClient() as client:
+                    response = await client.get("http://localhost:8000/api/fetch-device-data")
+                    if response.status_code == 200:
+                        logger.info("Scheduled device data fetch started successfully")
+                    else:
+                        logger.error(f"Failed to start scheduled device data fetch: {response.status_code} - {response.text}")
+            except Exception as e:
+                logger.error(f"Error during scheduled device data fetch: {e}")
+            
+            # Wait for one hour before the next fetch
+            await asyncio.sleep(3600)  # 3600 seconds = 1 hour
+    
+    # Start the periodic task
+    background_task = asyncio.create_task(periodic_data_fetch())
+    logger.info("Started periodic device data fetch task")
+    
+    yield
+    
+    # Shutdown: Cancel the background task
+    if background_task:
+        logger.info("Cancelling periodic device data fetch task")
+        background_task.cancel()
+        try:
+            await background_task
+        except asyncio.CancelledError:
+            logger.info("Periodic device data fetch task cancelled")
+
 # Initialize FastAPI app
-app = FastAPI()
+app = FastAPI(lifespan=lifespan)
 
 # Enable CORS
 app.add_middleware(
@@ -784,12 +825,33 @@ async def fetch_and_store_device_data(device_urn):
 # Create static directories if they don't exist
 os.makedirs("static/js", exist_ok=True)
 
+async def startup_tasks():
+    """Run startup tasks like initial data fetch"""
+    try:
+        # Wait a few seconds to let the server fully start
+        await asyncio.sleep(3)
+        
+        # Trigger data fetch for all devices
+        logger.info("Running initial device data fetch at startup")
+        async with httpx.AsyncClient() as client:
+            response = await client.get("http://localhost:8000/api/fetch-device-data")
+            if response.status_code == 200:
+                logger.info("Initial device data fetch started successfully")
+            else:
+                logger.error(f"Failed to start initial device data fetch: {response.status_code} - {response.text}")
+    except Exception as e:
+        logger.error(f"Error running startup tasks: {e}")
+
 if __name__ == "__main__":
     import uvicorn
     
     try:
         # Initialize database
         init_db()
+        
+        # Schedule startup tasks to run after server starts
+        background_tasks = BackgroundTasks()
+        background_tasks.add_task(startup_tasks)
         
         # Run the server
         uvicorn.run(

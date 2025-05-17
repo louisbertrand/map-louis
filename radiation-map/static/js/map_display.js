@@ -39,7 +39,7 @@ async function initMap() {
             // Add the reading value as a div icon with improved styling
             const icon = L.divIcon({
                 className: 'sensor-value-label',
-                html: `<div style="color: white; font-weight: bold; font-size: 16px; display: flex; justify-content: center; align-items: center; width: 100%; height: 100%; text-align: center; margin-top: -7px;">${reading}</div>`,
+                html: `<div style="color: white; font-weight: bold; font-size: 16px; display: flex; justify-content: center; align-items: center; width: 100%; height: 100%; text-align: center; margin-top: -3px;">${reading}</div>`,
                 iconSize: [40, 40], // Increased size
                 iconAnchor: [20, 20] // Centered
             });
@@ -166,6 +166,9 @@ async function createChartGraph(sensorId, containerId) {
             y: m.lnd_7318u
         }));
         
+        // Simplify to just use hour unit with good spacing
+        let timeUnit = 'hour';
+        
         // Create a Chart.js chart that matches the screenshot style
         popupCharts[containerId] = new Chart(ctx, {
             type: 'line',
@@ -219,8 +222,9 @@ async function createChartGraph(sensorId, containerId) {
                         time: {
                             unit: 'hour',
                             displayFormats: {
-                                hour: 'HH:mm'
-                            }
+                                hour: 'h:mm a'
+                            },
+                            tooltipFormat: 'MMM D, h:mm a'
                         },
                         grid: {
                             display: false
@@ -228,7 +232,7 @@ async function createChartGraph(sensorId, containerId) {
                         ticks: {
                             maxRotation: 0,
                             autoSkip: true,
-                            maxTicksLimit: 5
+                            maxTicksLimit: 6
                         }
                     }
                 }

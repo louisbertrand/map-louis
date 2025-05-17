@@ -15,7 +15,7 @@ import random
 import traceback
 from typing import List, Dict, Any, Optional, Generator
 from pydantic import BaseModel
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
 from pathlib import Path
 import requests
@@ -133,6 +133,7 @@ def init_db():
             CREATE TABLE IF NOT EXISTS device_fetch_status (
                 device_urn TEXT PRIMARY KEY,
                 last_fetched TIMESTAMP,
+                last_attempted TIMESTAMP,
                 last_measurement_time TIMESTAMP,
                 fetch_status TEXT,
                 error_message TEXT,
@@ -512,194 +513,242 @@ async def fetch_device_data(background_tasks: BackgroundTasks):
     Fetches the latest data for all configured devices from the Safecast API
     and stores it in the local database.
     """
+    devices_to_fetch = []
     with get_db(raise_http_exception=True) as conn:
         try:
-            # Check if we already have a recent fetch in progress for any device
-            status = conn.execute(
-                "SELECT fetch_status, last_fetched FROM device_fetch_status WHERE fetch_status = 'fetching'"
-            ).fetchone()
-            
-            if status and status[1] and (datetime.utcnow() - datetime.fromisoformat(status[1])).total_seconds() < 300:
+            # Check for ongoing fetches (optional, but good practice)
+            # status = conn.execute(
+            #     "SELECT fetch_status, last_fetched FROM device_fetch_status WHERE fetch_status = 'fetching'"
+            # ).fetchone()
+            # if status and status[1] and (datetime.utcnow() - datetime.fromisoformat(status[1])).total_seconds() < 300:
+            #     return {
+            #         "status": "already_fetching",
+            #         "message": "A fetch is already in progress. Please wait a few minutes before trying again."
+            #     }
+
+            # Validate which devices from DEVICE_URNS actually exist in the DB
+            for device_urn_candidate in DEVICE_URNS:
+                exists = conn.execute("SELECT 1 FROM devices WHERE device_urn = ?", (device_urn_candidate,)).fetchone()
+                if exists:
+                    devices_to_fetch.append(device_urn_candidate)
+                else:
+                    logger.warning(f"Device {device_urn_candidate} from DEVICE_URNS not found in 'devices' table. Skipping for this fetch cycle.")
+
+            if not devices_to_fetch:
+                logger.info("No valid devices found to fetch data for.")
                 return {
-                    "status": "already_fetching",
-                    "message": "A fetch is already in progress. Please wait a few minutes before trying again."
+                    "status": "no_devices_to_fetch",
+                    "message": "No configured and existing devices to fetch data for."
                 }
-            
-            # Start background tasks for each device
-            for device_urn in DEVICE_URNS:
+
+            # Start background tasks for each existing device
+            for device_urn in devices_to_fetch:
                 # Update the status to show we're starting a fetch for this device
                 conn.execute("""
-                    INSERT OR REPLACE INTO device_fetch_status (device_urn, last_fetched, fetch_status)
-                    VALUES (?, CURRENT_TIMESTAMP, 'fetching')
+                    INSERT OR REPLACE INTO device_fetch_status (device_urn, last_fetched, fetch_status, error_message)
+                    VALUES (?, CURRENT_TIMESTAMP, 'fetching', NULL)
                 """, (device_urn,))
                 
-                # Start the background task for this device
                 background_tasks.add_task(fetch_and_store_device_data, device_urn)
             
             conn.commit()
             
             return {
                 "status": "fetch_started",
-                "message": f"Fetching data for {len(DEVICE_URNS)} devices in the background"
+                "message": f"Fetching data for {len(devices_to_fetch)} devices in the background: {', '.join(devices_to_fetch)}"
             }
             
         except Exception as e:
             error_msg = f"Error starting data fetch: {str(e)}"
             logger.error(error_msg)
+            logger.error(traceback.format_exc()) # Log the full traceback for better debugging
             
-            # Update the status to show the error for all devices
-            for device_urn in DEVICE_URNS:
-                conn.execute("""
-                    UPDATE device_fetch_status 
-                    SET fetch_status = 'error', error_message = ?
-                    WHERE device_urn = ?
-                """, (str(e), device_urn))
-            conn.commit()
-            
+            # Attempt to update status to error for devices that were intended to be fetched
+            try:
+                if conn: # Ensure connection is still valid
+                    for device_urn in devices_to_fetch: # Only try to update devices we were about to fetch
+                        conn.execute("""
+                            UPDATE device_fetch_status 
+                            SET fetch_status = 'error', error_message = ?
+                            WHERE device_urn = ?
+                        """, (str(e)[:255], device_urn)) # Limit error message length
+                    conn.commit()
+            except Exception as e_conn_fail:
+                logger.error(f"Failed to update device_fetch_status to error during exception handling: {e_conn_fail}")
+
             raise HTTPException(status_code=500, detail=error_msg)
 
 async def fetch_and_store_device_data(device_urn):
-    """
-    Fetches device data from the Safecast API and stores it in the database.
-    This function is designed to be run in the background.
+    """Fetch data for a single device and store it."""
+    logger.info(f"Starting data fetch for device: {device_urn}")
+    # Use the new API endpoint structure - REMOVE .json
+    api_url = f"{SAFECAST_API_BASE}/device/{device_urn}" 
     
-    Args:
-        device_urn: The URN of the device to fetch data for
-    """
-    with get_db(raise_http_exception=True) as conn:
+    last_measurement_time_for_status_update = None
+    fetch_status = "error"  # Default status
+    error_message = None
+    
+    try:
+        with get_db() as conn:
+            device_exists_initial = conn.execute("SELECT 1 FROM devices WHERE device_urn = ?", (device_urn,)).fetchone()
+            if not device_exists_initial:
+                logger.warning(f"Device {device_urn} not found at the beginning of fetch. Skipping.")
+                # Update status to 'error' with a specific message if device is unexpectedly missing
+                conn.execute(
+                    "UPDATE device_fetch_status SET fetch_status = ?, last_fetched = ?, error_message = ? WHERE device_urn = ?",
+                    ("error", datetime.now(timezone.utc), f"Device {device_urn} not found in devices table.", device_urn)
+                )
+                return
+
+            # Set status to 'fetching'
+            conn.execute(
+                "UPDATE device_fetch_status SET fetch_status = 'fetching', last_attempted = ?, error_message = NULL WHERE device_urn = ?",
+                (datetime.now(timezone.utc), device_urn)
+            )
+            conn.commit()
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            logger.info(f"Requesting URL: {api_url}")
+            response = await client.get(api_url)
+            logger.info(f"Raw Safecast API response status for {device_urn}: {response.status_code}")
+            logger.info(f"Raw Safecast API response text (first 500 chars) for {device_urn}: {response.text[:500]}")
+            response.raise_for_status() 
+            
+            data = response.json()
+            logger.info(f"Type of data for {device_urn}: {type(data)}")
+
+            if not isinstance(data, dict):
+                logger.error(f"Expected a dictionary response from {api_url}, but got {type(data)}")
+                error_message = f"Unexpected data type {type(data)} from API."
+                raise ValueError(error_message)
+
+            current_values = data.get("current_values")
+            if not current_values:
+                logger.warning(f"No 'current_values' in API response for {device_urn}. Response: {data}")
+                error_message = "No 'current_values' in API response."
+                # Potentially update status to 'no_data' or keep 'error'
+                fetch_status = "no_data" # Or some other appropriate status
+                # No new data to process, but the fetch itself might not be an 'error' if the API call was successful
+                # We will update the status to 'no_data' or 'completed' with 0 new measurements later
+            
+            else:
+                logger.info(f"'current_values' for {device_urn}: {current_values}")
+                
+                latitude = current_values.get("loc_lat")
+                longitude = current_values.get("loc_lon")
+                # Assuming 'lnd_7318u' is the radiation value we want for 'last_reading'
+                # Fallback to other potential radiation fields if necessary, e.g., 'value_hr', 'value_cpm'
+                radiation_value = current_values.get("lnd_7318u") 
+                captured_at_str = current_values.get("when_captured")
+
+                if latitude is not None and longitude is not None and radiation_value is not None and captured_at_str:
+                    try:
+                        # Ensure latitude and longitude are valid numbers
+                        latitude = float(latitude)
+                        longitude = float(longitude)
+                        radiation_value = float(radiation_value) # Or int, depending on expected value
+
+                        # Parse the timestamp
+                        # Example format: "2025-05-17T02:59:17Z"
+                        last_seen_dt = datetime.fromisoformat(captured_at_str.replace("Z", "+00:00"))
+                        last_measurement_time_for_status_update = last_seen_dt # For status update
+                        
+                        with get_db() as conn:
+                            # Update the devices table with the latest info
+                            conn.execute(
+                                """
+                                UPDATE devices
+                                SET latitude = ?, longitude = ?, last_seen = ?, last_reading = ?
+                                WHERE device_urn = ?
+                                """,
+                                (latitude, longitude, last_seen_dt, radiation_value, device_urn)
+                            )
+                            
+                            # For simplicity, we are not inserting into 'measurements' table here.
+                            # If historical tracking per reading is needed, that logic would go here,
+                            # potentially checking if this exact reading (by timestamp) already exists.
+                            # For now, we just update the 'devices' table with the latest.
+                            logger.info(f"Updated device {device_urn} with: lat={latitude}, lon={longitude}, reading={radiation_value}, seen={last_seen_dt}")
+                            conn.commit()
+                        fetch_status = "completed" 
+                    except ValueError as ve:
+                        logger.error(f"Data parsing error for {device_urn}: {ve}. Data: {current_values}")
+                        error_message = f"Data parsing error: {ve}"
+                    except Exception as e:
+                        logger.error(f"Database update error for {device_urn}: {e}")
+                        error_message = f"DB update error: {e}"
+                else:
+                    missing_fields = []
+                    if latitude is None: missing_fields.append("latitude")
+                    if longitude is None: missing_fields.append("longitude")
+                    if radiation_value is None: missing_fields.append("radiation_value (lnd_7318u)")
+                    if captured_at_str is None: missing_fields.append("when_captured")
+                    logger.warning(f"Missing critical data in 'current_values' for {device_urn}: {', '.join(missing_fields)}. Data: {current_values}")
+                    error_message = f"Missing data in current_values: {', '.join(missing_fields)}"
+                    fetch_status = "error" # Or "no_data" if preferred for this case
+
+        # Final status update after attempt
+        with get_db() as conn:
+            current_time_utc = datetime.now(timezone.utc)
+            update_query = """
+                UPDATE device_fetch_status 
+                SET fetch_status = ?, last_fetched = ?, error_message = ?
+            """
+            params = [fetch_status, current_time_utc, error_message]
+
+            if last_measurement_time_for_status_update:
+                update_query += ", last_measurement_time = ?"
+                params.append(last_measurement_time_for_status_update)
+            
+            update_query += " WHERE device_urn = ?"
+            params.append(device_urn)
+            
+            conn.execute(update_query, tuple(params))
+            conn.commit()
+            logger.info(f"Fetch status for {device_urn} updated to '{fetch_status}'. Error: {error_message}")
+
+    except httpx.HTTPStatusError as exc:
+        logger.error(f"HTTP error fetching data for {device_urn}: {exc.response.status_code} - {exc.response.text}")
+        error_message = f"HTTP error: {exc.response.status_code}"
+        fetch_status = "error"
+    except httpx.RequestError as exc:
+        logger.error(f"Request error fetching data for {device_urn}: {exc}")
+        error_message = f"Request error: {type(exc).__name__}"
+        fetch_status = "error"
+    except json.JSONDecodeError as exc:
+        logger.error(f"JSON decode error for {device_urn}: {exc}. Response text was: {response.text[:500] if 'response' in locals() else 'N/A'}")
+        error_message = "JSON decode error"
+        fetch_status = "error"
+    except ValueError as ve: # Catch specific ValueErrors raised by our logic
+        logger.error(f"ValueError during processing for {device_urn}: {ve}")
+        # error_message is already set if this is one of our ValueErrors
+        if not error_message: error_message = str(ve)
+        fetch_status = "error"
+    except Exception as e:
+        logger.error(f"Unexpected error in fetch_and_store_device_data for {device_urn}: {e}", exc_info=True)
+        error_message = f"Unexpected error: {type(e).__name__}"
+        fetch_status = "error"
+    finally:
+        # This finally block ensures status is updated even if an unexpected error occurs before the specific try-except for status update
         try:
-            # Extract device ID from URN (handle both formats: 'geigiecast:123' and 'geigiecast-zen:123')
-            device_id = device_urn.split(':')[-1]  # Get the part after the last colon
-            
-            # Build the API URL for the device endpoint
-            url = f"{SAFECAST_API_BASE}/device/{device_urn}"
-            
-            # Make the API request
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=30.0)
-                response.raise_for_status()
-                
-                # Parse the response as JSON
-                data = response.json()
-                
-                # Check if we have current values
-                if 'current_values' not in data:
-                    logger.warning(f"No current values found for device {device_urn}")
-                    return
-                
-                current_values = data['current_values']
-                
-                # Check if there's a measurement
-                if 'lnd_7318u' not in current_values or current_values['lnd_7318u'] is None:
-                    logger.warning(f"No radiation measurement found for device {device_urn}")
-                    return
-                
-                # Update device information with location if available
-                if current_values.get('loc_lat') and current_values.get('loc_lon'):
-                    conn.execute("""
-                        UPDATE devices 
-                        SET 
-                            latitude = ?,
-                            longitude = ?,
-                            last_seen = ?
-                        WHERE device_urn = ?
-                    """, (
-                        current_values['loc_lat'],
-                        current_values['loc_lon'],
-                        current_values.get('when_captured', '').replace('Z', '+00:00'),
-                        device_urn
-                    ))
+            with get_db() as conn:
+                # Check if status was already updated by the main logic block
+                # This is a safety net; ideally, it's updated before finally.
+                status_record = conn.execute("SELECT fetch_status FROM device_fetch_status WHERE device_urn = ?", (device_urn,)).fetchone()
+                if status_record and status_record[0] == 'fetching': # If still 'fetching', means an error happened before final update
+                    logger.warning(f"Fetch for {device_urn} was interrupted while 'fetching'. Updating status to '{fetch_status}'.")
+                    conn.execute(
+                        "UPDATE device_fetch_status SET fetch_status = ?, last_fetched = ?, error_message = ? WHERE device_urn = ?",
+                        (fetch_status, datetime.now(timezone.utc), error_message or "Interrupted", device_urn)
+                    )
                     conn.commit()
-                
-                # Prepare the measurement data
-                measurement = {
-                    'captured_at': current_values.get('when_captured', '').replace('Z', '+00:00'),
-                    'latitude': current_values.get('loc_lat'),
-                    'longitude': current_values.get('loc_lon'),
-                    'value': current_values['lnd_7318u'],
-                    'unit': 'cpm',
-                    'device_urn': device_urn,
-                    'device_id': current_values.get('device'),
-                    'device_class': current_values.get('device_class', 'GeigerCounter')
-                }
-                
-                # Convert to a list for consistent processing
-                measurements_data = [measurement] if measurement['value'] is not None else []
-            
-            # Store the measurements in the database
-            new_measurements = 0
-            for measurement in measurements_data:
-                try:
-                    captured_at = measurement.get('captured_at')
-                    
-                    conn.execute("""
-                        INSERT OR IGNORE INTO measurements (
-                            device_urn, when_captured, lnd_7318u, latitude, longitude,
-                            service_uploaded, service_transport
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """, (
-                        device_urn,
-                        captured_at,
-                        measurement.get('value'),
-                        measurement.get('latitude'),
-                        measurement.get('longitude'),
-                        measurement.get('service_uploaded'),
-                        measurement.get('service_transport')
-                    ))
-                    new_measurements += 1
-                except Exception as e:
-                    logger.error(f"Error inserting measurement for device {device_urn}: {e}")
-            
-            # Update the device's last seen time and location if we have new measurements
-            if new_measurements > 0:
-                # First, ensure the device exists in the devices table
-                conn.execute("""
-                    INSERT OR IGNORE INTO devices (device_urn, device_id, device_class)
-                    VALUES (?, ?, ?)
-                """, (device_urn, device_id, 'GeigerCounter'))
-                
-                # Then update the last seen time and location
-                conn.execute("""
-                    UPDATE devices 
-                    SET last_seen = CURRENT_TIMESTAMP,
-                        latitude = (SELECT latitude FROM measurements 
-                                  WHERE device_urn = ? 
-                                  ORDER BY when_captured DESC LIMIT 1),
-                        longitude = (SELECT longitude FROM measurements 
-                                   WHERE device_urn = ? 
-                                   ORDER BY when_captured DESC LIMIT 1),
-                        last_reading = (SELECT lnd_7318u FROM measurements 
-                                      WHERE device_urn = ? 
-                                      ORDER BY when_captured DESC LIMIT 1)
-                    WHERE device_urn = ?
-                """, (device_urn, device_urn, device_urn, device_urn))
-            
-            # Update fetch status
-            conn.execute("""
-                UPDATE device_fetch_status 
-                SET last_fetched = CURRENT_TIMESTAMP,
-                    last_measurement_time = (SELECT MAX(when_captured) FROM measurements WHERE device_urn = ?),
-                    fetch_status = 'success',
-                    error_message = NULL
-                WHERE device_urn = ?
-            """, (device_urn, device_urn))
-            
-            conn.commit()
-            logger.info(f"Successfully fetched {new_measurements} new measurements for device {device_urn}")
-            
-        except Exception as e:
-            error_msg = f"Error in background fetch for device {device_urn}: {str(e)}"
-            logger.error(error_msg)
-            
-            # Update fetch status with error
-            conn.execute("""
-                UPDATE device_fetch_status 
-                SET fetch_status = 'error', 
-                    error_message = ?,
-                    last_fetched = CURRENT_TIMESTAMP
-                WHERE device_urn = ?
-            """, (device_urn, str(e))) # Corrected: Ensured str(e) is passed for the error message
-            conn.commit()
+        except Exception as db_exc:
+            logger.error(f"CRITICAL: Failed to update fetch status in finally block for {device_urn}: {db_exc}")
+        
+        logger.info(f"Finished data fetch attempt for device: {device_urn} with status: {fetch_status}. Error: {error_message}")
+
+# Pydantic models for API requests/responses
+# ... existing code ...
 
 # Create static directories if they don't exist
 os.makedirs("static/js", exist_ok=True)

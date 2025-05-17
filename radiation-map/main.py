@@ -136,7 +136,7 @@ def init_db():
             # Transport_info is also derived.
             # KEEP devices and device_fetch_status data if possible.
             volatile_drop_queries = [
-                "DROP TABLE IF EXISTS measurements",
+                # "DROP TABLE IF EXISTS measurements",  # COMMENTED OUT TO PRESERVE MEASUREMENT DATA BETWEEN RESTARTS
                 # "DROP TABLE IF EXISTS transport_info", # Decide if this needs to be dropped
             ]
             

@@ -1,7 +1,7 @@
-from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks, Request
+from fastapi import FastAPI, HTTPException, Depends, Query, BackgroundTasks, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse, JSONResponse, HTMLResponse
+from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
 from fastapi.staticfiles import StaticFiles
 import duckdb
@@ -18,6 +18,7 @@ from pydantic import BaseModel
 from datetime import datetime, timedelta
 from contextlib import contextmanager
 from pathlib import Path
+import requests
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -78,9 +79,9 @@ def init_db():
             # Drop and recreate tables to ensure clean state
             drop_queries = [
                 "DROP TABLE IF EXISTS measurements",
+                "DROP TABLE IF EXISTS device_fetch_status",
                 "DROP TABLE IF EXISTS devices",
                 "DROP TABLE IF EXISTS transport_info",
-                "DROP TABLE IF EXISTS device_fetch_status"
             ]
             
             for query in drop_queries:
@@ -302,14 +303,31 @@ def add_sample_data(conn):
 async def read_root(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
+@app.get("/admin", response_class=HTMLResponse)
+async def admin_page(request: Request):
+    """Render the admin page for managing devices."""
+    with get_db() as conn:
+        devices = conn.execute("SELECT device_urn, device_id, device_class, last_seen FROM devices").fetchall()
+        devices = [dict(zip(['device_urn', 'device_id', 'device_class', 'last_seen'], d)) for d in devices]
+    return templates.TemplateResponse("admin.html", {"request": request, "devices": devices})
+
 @app.get("/api/devices")
 async def get_devices():
     try:
         with get_db() as conn:
             try:
+                # First, check if transport_info table exists
+                table_exists = False
+                try:
+                    check_table = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='transport_info'").fetchone()
+                    table_exists = check_table is not None
+                except Exception as table_error:
+                    logger.warning(f"Error checking if transport_info table exists: {table_error}")
+                    table_exists = False
+                
                 # First, get all devices
                 devices_query = """
-                    SELECT device_urn, device_id, device_class, last_seen, latitude, longitude
+                    SELECT device_urn, device_id, device_class, last_seen, latitude, longitude, last_reading
                     FROM devices
                 """
                 
@@ -327,20 +345,21 @@ async def get_devices():
                         last_seen = device_row[3]
                         latitude = device_row[4]
                         longitude = device_row[5]
+                        last_reading = device_row[6]
                         
-                        # Get transport info if available
-                        transport_query = """
-                            SELECT city, country 
-                            FROM transport_info 
-                            WHERE device_urn = ?
-                            LIMIT 1
-                        """
-                        
+                        # Get transport info if the table exists
                         transport_result = None
-                        try:
-                            transport_result = conn.execute(transport_query, (device_urn,)).fetchone()
-                        except Exception as transport_error:
-                            logger.warning(f"Error fetching transport info for device {device_urn}: {transport_error}")
+                        if table_exists:
+                            try:
+                                transport_query = """
+                                    SELECT city, country 
+                                    FROM transport_info 
+                                    WHERE device_urn = ?
+                                    LIMIT 1
+                                """
+                                transport_result = conn.execute(transport_query, (device_urn,)).fetchone()
+                            except Exception as transport_error:
+                                logger.warning(f"Error fetching transport info for device {device_urn}: {transport_error}")
                         
                         # Build device data
                         device_data = {
@@ -350,6 +369,7 @@ async def get_devices():
                             "latitude": float(latitude) if latitude is not None else None,
                             "longitude": float(longitude) if longitude is not None else None,
                             "last_seen": last_seen.isoformat() if hasattr(last_seen, 'isoformat') else str(last_seen) if last_seen else None,
+                            "last_reading": float(last_reading) if last_reading is not None else None,
                             "location": None
                         }
                         
@@ -432,6 +452,58 @@ async def get_measurements(device_urn: str, days: int = Query(7, gt=0, le=365, d
 os.makedirs("templates", exist_ok=True)
 os.makedirs("static/css", exist_ok=True)
 os.makedirs("static/js", exist_ok=True)
+
+# Admin API endpoints
+class DeviceCreate(BaseModel):
+    device_urn: str
+    device_id: int
+    device_class: str = "GeigerCounter"
+    dev_test: bool = False
+
+@app.post("/api/admin/devices")
+async def add_device(device: DeviceCreate):
+    """Add a new device."""
+    with get_db() as conn:
+        try:
+            conn.execute("""
+                INSERT INTO devices (device_urn, device_id, device_class, dev_test, dev_dashboard, last_updated)
+                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            """, (
+                device.device_urn,
+                device.device_id,
+                device.device_class,
+                device.dev_test,
+                f'https://safecast.org/tilemap/?y1=90&x1=-180&y2=-90&x2=180&l=0&m=0&sense=1&since=0&until=0&devices={device.device_id}'
+            ))
+            
+            # Initialize fetch status
+            conn.execute("""
+                INSERT OR IGNORE INTO device_fetch_status (device_urn, last_fetched, fetch_status)
+                VALUES (?, NULL, 'pending')
+            """, (device.device_urn,))
+            
+            conn.commit()
+            return {"message": f"Device {device.device_urn} added successfully"}
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/api/admin/devices/{device_urn}")
+async def remove_device(device_urn: str):
+    """Remove a device by its URN."""
+    with get_db() as conn:
+        try:
+            # Delete from device_fetch_status first due to foreign key constraint
+            conn.execute("DELETE FROM device_fetch_status WHERE device_urn = ?", (device_urn,))
+            result = conn.execute("DELETE FROM devices WHERE device_urn = ? RETURNING device_urn", (device_urn,))
+            deleted = result.fetchone()
+            if not deleted:
+                raise HTTPException(status_code=404, detail="Device not found")
+            conn.commit()
+            return {"message": f"Device {device_urn} removed successfully"}
+        except Exception as e:
+            conn.rollback()
+            raise HTTPException(status_code=400, detail=str(e))
 
 # Endpoint to fetch and store device data from Safecast API
 @app.get("/api/fetch-device-data")
@@ -595,9 +667,12 @@ async def fetch_and_store_device_data(device_urn):
                                   ORDER BY when_captured DESC LIMIT 1),
                         longitude = (SELECT longitude FROM measurements 
                                    WHERE device_urn = ? 
-                                   ORDER BY when_captured DESC LIMIT 1)
+                                   ORDER BY when_captured DESC LIMIT 1),
+                        last_reading = (SELECT lnd_7318u FROM measurements 
+                                      WHERE device_urn = ? 
+                                      ORDER BY when_captured DESC LIMIT 1)
                     WHERE device_urn = ?
-                """, (device_urn, device_urn, device_urn))
+                """, (device_urn, device_urn, device_urn, device_urn))
             
             # Update fetch status
             conn.execute("""
@@ -623,141 +698,11 @@ async def fetch_and_store_device_data(device_urn):
                     error_message = ?,
                     last_fetched = CURRENT_TIMESTAMP
                 WHERE device_urn = ?
-            """, (device_urn, str(e)))
+            """, (device_urn, str(e))) # Corrected: Ensured str(e) is passed for the error message
             conn.commit()
-
-# Initialize the database when the application starts
-init_db()
-
-# Create basic HTML template
-with open("templates/index.html", "w") as f:
-    f.write("""
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>Radiation Sensor Map</title>
-        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
-        <style>
-            #map { height: 600px; }
-            .chart-container {
-                width: 100%;
-                max-width: 800px;
-                margin: 20px auto;
-            }
-        </style>
-    </head>
-    <body>
-        <h1 style="text-align: center;">Radiation Sensor Network</h1>
-        <div id="map"></div>
-        <div id="chart" class="chart-container"></div>
-        
-        <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
-        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-        <script src="/static/js/main.js"></script>
-    </body>
-    </html>
-    """)
 
 # Create static directories if they don't exist
 os.makedirs("static/js", exist_ok=True)
-
-# Create main.js
-with open("static/js/main.js", "w") as f:
-    f.write("""
-    let map;
-    let chart = null;
-
-    async function initMap() {
-        // Initialize map
-        map = L.map('map').setView([20, 0], 2);
-        
-        // Add OpenStreetMap tiles
-        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
-            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-        }).addTo(map);
-
-        // Load sensor data
-        try {
-            const response = await fetch('/api/devices');
-            const data = await response.json();
-            
-            // Add markers for each sensor
-            data.devices.forEach(sensor => {
-                const marker = L.marker([sensor.latitude, sensor.longitude])
-                    .addTo(map)
-                    .bindPopup(`
-                        <h3>${sensor.device_urn}</h3>
-                        <p>${sensor.device_class}</p>
-                        <button onclick="loadSensorData('${sensor.device_urn}')">Show History</button>
-                    `);
-                
-                marker.sensorId = sensor.device_urn;
-                marker.sensorName = sensor.device_urn;
-            });
-            
-        } catch (error) {
-            console.error('Error loading sensor data:', error);
-        }
-    }
-
-    async function loadSensorData(sensorId) {
-        try {
-            const response = await fetch(`/api/measurements/${sensorId}?days=30`);
-            const data = await response.json();
-            
-            // Prepare chart data
-            const timestamps = data.measurements.map(m => new Date(m.when_captured));
-            const values = data.measurements.map(m => m.lnd_7318u);
-            
-            // Create or update chart
-            const ctx = document.getElementById('chart').getContext('2d');
-            
-            if (chart) {
-                chart.destroy();
-            }
-            
-            chart = new Chart(ctx, {
-                type: 'line',
-                data: {
-                    labels: timestamps,
-                    datasets: [{
-                        label: `Radiation Level - ${sensorId}`,
-                        data: values,
-                        borderColor: 'rgb(75, 192, 192)',
-                        tension: 0.1
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    scales: {
-                        x: {
-                            type: 'time',
-                            time: {
-                                unit: 'day'
-                            },
-                            title: {
-                                display: true,
-                                text: 'Date'
-                            }
-                        },
-                        y: {
-                            title: {
-                                display: true,
-                                text: 'Radiation'
-                            }
-                        }
-                    }
-                }
-            });
-            
-        } catch (error) {
-            console.error('Error loading sensor data:', error);
-        }
-    }
-
-    // Initialize the map when the page loads
-    document.addEventListener('DOMContentLoaded', initMap);
-    """)
 
 if __name__ == "__main__":
     import uvicorn

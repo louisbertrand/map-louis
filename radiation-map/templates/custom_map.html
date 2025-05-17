@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Radiation Sensor Network</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.7.1/dist/leaflet.css" />
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 0;
+        }
+        h1 {
+            text-align: center;
+            padding: 20px;
+            margin: 0;
+            background-color: #f5f5f5;
+            border-bottom: 1px solid #ddd;
+        }
+        #map { 
+            height: 600px; 
+            width: 100%;
+        }
+        .chart-container {
+            width: 100%;
+            max-width: 800px;
+            margin: 20px auto;
+            padding: 0 20px;
+        }
+        .sensor-value-label {
+            text-align: center;
+            line-height: 30px;
+        }
+        .sensor-value-label div {
+            background: transparent;
+        }
+    </style>
+</head>
+<body>
+    <h1>Radiation Sensor Network</h1>
+    <div id="map"></div>
+    <div class="chart-container">
+        <canvas id="chart"></canvas>
+    </div>
+    
+    <script src="https://unpkg.com/leaflet@1.7.1/dist/leaflet.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script src="/static/js/map_style.js"></script>
+</body>
+</html> 

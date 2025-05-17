@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Device Management - Admin</title>
+    <link href="https://cdn.jsdelivr.net/npm/tailwindcss@2.2.19/dist/tailwind.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0-beta3/css/all.min.css">
+</head>
+<body class="bg-gray-100">
+    <div class="container mx-auto px-4 py-8">
+        <h1 class="text-3xl font-bold mb-8 text-gray-800">Device Management</h1>
+        
+        <!-- Add Device Form -->
+        <div class="bg-white rounded-lg shadow-md p-6 mb-8">
+            <h2 class="text-xl font-semibold mb-4">Add New Device</h2>
+            <form id="addDeviceForm" class="space-y-4">
+                <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">Device URN</label>
+                        <input type="text" id="deviceUrn" required 
+                               class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                    </div>
+                    <div>
+                        <label class="block text-sm font-medium text-gray-700">Device ID</label>
+                        <input type="number" id="deviceId" required 
+                               class="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-blue-500 focus:ring-blue-500">
+                    </div>
+                </div>
+                <div class="flex justify-end">
+                    <button type="submit" 
+                            class="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500">
+                        Add Device
+                    </button>
+                </div>
+            </form>
+        </div>
+
+        <!-- Devices List -->
+        <div class="bg-white rounded-lg shadow-md overflow-hidden">
+            <h2 class="text-xl font-semibold p-6 border-b">Current Devices</h2>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Device URN</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Device ID</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Type</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Last Seen</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="devicesList" class="bg-white divide-y divide-gray-200">
+                        {% for device in devices %}
+                        <tr>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-900">{{ device.device_urn }}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ device.device_id }}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ device.device_class }}</td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
+                                {{ device.last_seen or 'Never' }}
+                            </td>
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
+                                <button onclick="removeDevice('{{ device.device_urn }}')" 
+                                        class="text-red-600 hover:text-red-900">
+                                    <i class="fas fa-trash"></i> Remove
+                                </button>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        document.getElementById('addDeviceForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            const deviceUrn = document.getElementById('deviceUrn').value;
+            const deviceId = parseInt(document.getElementById('deviceId').value);
+            
+            try {
+                const response = await fetch('/api/admin/devices', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        device_urn: deviceUrn,
+                        device_id: deviceId,
+                        device_class: 'GeigerCounter',
+                        dev_test: false
+                    })
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to add device');
+                }
+                
+                alert('Device added successfully!');
+                window.location.reload();
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+                console.error('Error:', error);
+            }
+        });
+        
+        async function removeDevice(deviceUrn) {
+            if (!confirm(`Are you sure you want to remove device ${deviceUrn}?`)) {
+                return;
+            }
+            
+            try {
+                const response = await fetch(`/api/admin/devices/${encodeURIComponent(deviceUrn)}`, {
+                    method: 'DELETE'
+                });
+                
+                if (!response.ok) {
+                    const error = await response.json();
+                    throw new Error(error.detail || 'Failed to remove device');
+                }
+                
+                alert('Device removed successfully!');
+                window.location.reload();
+            } catch (error) {
+                alert(`Error: ${error.message}`);
+                console.error('Error:', error);
+            }
+        }
+    </script>
+</body>
+</html>

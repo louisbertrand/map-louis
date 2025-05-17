@@ -10,9 +10,9 @@ for row in result:
     print(f"Device: {row[0]}, Status: {row[1]}, Last fetched: {row[2]}")
 
 print("\n=== Device Info ===")
-result = conn.execute('SELECT device_urn, device_id, latitude, longitude, last_reading FROM devices').fetchall()
+result = conn.execute('SELECT device_urn, device_id, latitude, longitude, last_reading, last_seen FROM devices').fetchall()
 for row in result:
-    print(f"Device: {row[0]}, ID: {row[1]}, Location: ({row[2]}, {row[3]}), Last reading: {row[4]} cpm")
+    print(f"Device: {row[0]}, ID: {row[1]}, Location: ({row[2]}, {row[3]}), Last reading: {row[4]} cpm, Last seen: {row[5]}")
 
 # Check measurements for each device
 for device in conn.execute('SELECT DISTINCT device_urn FROM devices').fetchall():

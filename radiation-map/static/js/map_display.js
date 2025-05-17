@@ -53,10 +53,31 @@ async function initMap() {
             // Generate the external URL using the full device_urn
             const externalURL = `https://dashboard.radnote.org/d/cdq671mxg2cjka/radnote-overview?var-device=dev:${sensor.device_urn}`;
             
-            // Popup with sensor ID, link to RadNote dashboard, and chart
-            marker.bindPopup(`
+            // Format the last seen date if available
+            let lastSeenFormatted = 'Unknown';
+            if (sensor.last_seen) {
+                try {
+                    const lastSeen = new Date(sensor.last_seen);
+                    lastSeenFormatted = lastSeen.toLocaleString();
+                    console.log(`Formatted timestamp for ${sensorId}: ${lastSeenFormatted} from ${sensor.last_seen}`);
+                } catch (e) {
+                    console.error(`Error formatting date: ${e.message}`, sensor.last_seen);
+                    lastSeenFormatted = sensor.last_seen || 'Unknown';
+                }
+            } else {
+                console.warn(`No last_seen data available for ${sensorId}`);
+            }
+            
+            console.log(`Device ${sensorId} data:`, sensor);
+            
+            // Popup with sensor ID, timestamp, link to RadNote dashboard, and chart
+            const popupHtml = `
                 <div style="width: 280px;">
                     <h3 style="margin: 5px 0; text-align: center; padding-bottom: 2px;">Sensor ${sensorId}</h3>
+                    <div style="text-align: center; margin: 8px 0; padding: 8px; background-color: #f0f8ff; border: 1px solid #007bff; border-radius: 5px; font-size: 14px; color: #000;">
+                        <strong>Last Reading Time:</strong><br>
+                        ${lastSeenFormatted}
+                    </div>
                     <div style="text-align: center; margin-bottom: 8px;">
                         <a href="${externalURL}" target="_blank" style="font-size: 12px; color: #3498db; text-decoration: none;">
                             More Information <i style="font-size: 10px;">↗</i>
@@ -64,7 +85,11 @@ async function initMap() {
                     </div>
                     <div id="popup-graph-${sensorId}" style="width: 100%; height: 200px;"></div>
                 </div>
-            `, { maxWidth: 300 });
+            `;
+            
+            console.log(`Popup HTML for ${sensorId}:`, popupHtml);
+            
+            marker.bindPopup(popupHtml, { maxWidth: 300 });
             
             // Restore original popupopen event for graph creation
             marker.on('popupopen', function() {

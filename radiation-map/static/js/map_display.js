@@ -30,16 +30,16 @@ async function initMap() {
             const marker = L.circleMarker([sensor.latitude, sensor.longitude], {
                 radius: 20, // Increased size
                 fillColor: '#2ecc71',
-                color: '#27ae60',
-                weight: 2,
+                color: '#ffffff', // White border
+                weight: 3, // Thicker border
                 opacity: 1,
-                fillOpacity: 0.8
+                fillOpacity: 0.9
             }).addTo(map);
             
             // Add the reading value as a div icon with improved styling
             const icon = L.divIcon({
                 className: 'sensor-value-label',
-                html: `<div style="color: white; font-weight: bold; font-size: 14px; display: flex; justify-content: center; align-items: center; width: 100%; height: 100%; text-align: center; margin-top: -5px;">${reading}</div>`,
+                html: `<div style="color: white; font-weight: bold; font-size: 16px; display: flex; justify-content: center; align-items: center; width: 100%; height: 100%; text-align: center; margin-top: -7px;">${reading}</div>`,
                 iconSize: [40, 40], // Increased size
                 iconAnchor: [20, 20] // Centered
             });
@@ -50,10 +50,18 @@ async function initMap() {
             // Get the sensor ID for display
             const sensorId = sensor.device_id || sensor.device_urn.split(':').pop();
             
-            // Popup with just sensor ID and chart
+            // Generate the external URL using the full device_urn
+            const externalURL = `https://dashboard.radnote.org/d/cdq671mxg2cjka/radnote-overview?var-device=dev:${sensor.device_urn}`;
+            
+            // Popup with sensor ID, link to RadNote dashboard, and chart
             marker.bindPopup(`
                 <div style="width: 280px;">
-                    <h3 style="margin: 5px 0; text-align: center; padding-bottom: 5px;">Sensor ${sensorId}</h3>
+                    <h3 style="margin: 5px 0; text-align: center; padding-bottom: 2px;">Sensor ${sensorId}</h3>
+                    <div style="text-align: center; margin-bottom: 8px;">
+                        <a href="${externalURL}" target="_blank" style="font-size: 12px; color: #3498db; text-decoration: none;">
+                            More Information <i style="font-size: 10px;">↗</i>
+                        </a>
+                    </div>
                     <div id="popup-graph-${sensorId}" style="width: 100%; height: 200px;"></div>
                 </div>
             `, { maxWidth: 300 });
@@ -100,7 +108,7 @@ async function createChartGraph(sensorId, containerId) {
         `;
         
         console.log(`Fetching data for sensor ${sensorId}`);
-        const response = await fetch(`/api/measurements/${sensorId}?days=7`);
+        const response = await fetch(`/api/measurements/${sensorId}?days=30`);
         const data = await response.json();
         console.log(`Received data for ${sensorId}:`, data);
         
@@ -126,7 +134,22 @@ async function createChartGraph(sensorId, containerId) {
         
         // Create a canvas for the chart
         const canvas = document.createElement('canvas');
+        canvas.style.height = '180px';
         container.appendChild(canvas);
+        
+        // Add external history link if available
+        if (data.external_history_url) {
+            const linkDiv = document.createElement('div');
+            linkDiv.style.textAlign = 'center';
+            linkDiv.style.marginTop = '10px';
+            linkDiv.style.fontSize = '12px';
+            linkDiv.innerHTML = `
+                <a href="${data.external_history_url}" target="_blank" style="color: #3498db; text-decoration: none;">
+                    More Information <i style="font-size: 10px;">↗</i>
+                </a>
+            `;
+            container.appendChild(linkDiv);
+        }
         
         // Prepare data for Chart.js
         const ctx = canvas.getContext('2d');
@@ -278,10 +301,34 @@ async function loadSensorData(sensorId) {
         }));
         
         // Create or update chart
-        const ctx = document.getElementById('chart').getContext('2d');
+        const chartContainer = document.getElementById('chart');
+        const ctx = chartContainer.getContext('2d');
         
         if (chart) {
             chart.destroy();
+        }
+        
+        // Create title with external link if available
+        const chartTitle = document.getElementById('chart-title') || document.createElement('h2');
+        chartTitle.id = 'chart-title';
+        chartTitle.style.textAlign = 'center';
+        chartTitle.style.marginBottom = '20px';
+        
+        // Format title with link if available
+        if (data.external_history_url) {
+            chartTitle.innerHTML = `
+                Radiation History - Device ${sensorId.split(':').pop()} 
+                <a href="${data.external_history_url}" target="_blank" style="font-size: 0.7em; color: #3498db; text-decoration: none; margin-left: 10px;">
+                    More Information <i style="font-size: 10px;">↗</i>
+                </a>
+            `;
+        } else {
+            chartTitle.textContent = `Radiation History - Device ${sensorId.split(':').pop()}`;
+        }
+        
+        // Add title before the chart if it doesn't exist
+        if (!document.getElementById('chart-title')) {
+            chartContainer.parentNode.insertBefore(chartTitle, chartContainer);
         }
         
         chart = new Chart(ctx, {
@@ -316,6 +363,12 @@ async function loadSensorData(sensorId) {
                             display: true,
                             text: 'Date'
                         }
+                    }
+                },
+                plugins: {
+                    title: {
+                        display: true,
+                        text: `Last ${data.max_days} Days of Radiation Data`
                     }
                 }
             }

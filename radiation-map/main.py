@@ -20,6 +20,9 @@ from contextlib import contextmanager, asynccontextmanager
 from pathlib import Path
 import requests
 
+# Import config settings
+from config import MAX_DATA_DAYS, EXTERNAL_HISTORY_URL, DEFAULT_MAP_CENTER, DEFAULT_MAP_ZOOM, AUTO_REFRESH_INTERVAL_SECONDS
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -32,9 +35,11 @@ background_task = None
 async def lifespan(app: FastAPI):
     # Startup: Launch periodic data fetch
     global background_task
+    last_cleanup = datetime.now() - timedelta(days=1)  # Initialize to run cleanup on first cycle
     
     async def periodic_data_fetch():
-        """Periodically fetch device data every hour"""
+        """Periodically fetch device data based on config setting"""
+        nonlocal last_cleanup
         while True:
             try:
                 logger.info("Running scheduled device data fetch")
@@ -44,15 +49,24 @@ async def lifespan(app: FastAPI):
                         logger.info("Scheduled device data fetch started successfully")
                     else:
                         logger.error(f"Failed to start scheduled device data fetch: {response.status_code} - {response.text}")
+                
+                # Run cleanup once per day
+                now = datetime.now()
+                if (now - last_cleanup).days >= 1:
+                    logger.info("Running daily data cleanup")
+                    await cleanup_old_data()
+                    last_cleanup = now
+                
             except Exception as e:
                 logger.error(f"Error during scheduled device data fetch: {e}")
             
-            # Wait for one hour before the next fetch
-            await asyncio.sleep(3600)  # 3600 seconds = 1 hour
+            # Wait for the configured refresh interval before the next fetch
+            logger.info(f"Waiting {AUTO_REFRESH_INTERVAL_SECONDS} seconds until next data refresh")
+            await asyncio.sleep(AUTO_REFRESH_INTERVAL_SECONDS)
     
     # Start the periodic task
     background_task = asyncio.create_task(periodic_data_fetch())
-    logger.info("Started periodic device data fetch task")
+    logger.info(f"Started periodic device data fetch task (every {AUTO_REFRESH_INTERVAL_SECONDS} seconds)")
     
     yield
     
@@ -223,7 +237,7 @@ def init_db():
                     device_id,
                     'GeigerCounter', # Default class
                     False,           # Default dev_test
-                    f'https://safecast.org/tilemap/?y1=90&x1=-180&y2=-90&x2=180&l=0&m=0&sense=1&since=0&until=0&devices={device_id}'
+                    f'https://dashboard.radnote.org/d/cdq671mxg2cjka/radnote-overview?var-device=dev:{device_id}'
                 ))
                 
                 # Initialize fetch status if it doesn't exist using INSERT OR IGNORE
@@ -471,7 +485,7 @@ async def get_devices():
         raise HTTPException(status_code=500, detail=error_msg)
 
 @app.get("/api/measurements/{device_urn}")
-async def get_measurements(device_urn: str, days: int = Query(7, gt=0, le=365, description="Number of days of data to return")):
+async def get_measurements(device_urn: str, days: int = Query(default=7, gt=0, le=MAX_DATA_DAYS, description=f"Number of days of data to return (max {MAX_DATA_DAYS} days)")):
     """Get measurements for a specific device over the last N days."""
     try:
         with get_db() as conn:
@@ -557,7 +571,16 @@ async def get_measurements(device_urn: str, days: int = Query(7, gt=0, le=365, d
                 
                 logger.info(f"Fallback query returned {len(measurements)} measurements")
             
-            return {"measurements": measurements}
+            # Create the external history URL using device_urn
+            external_history_url = None
+            if device_urn:
+                external_history_url = EXTERNAL_HISTORY_URL.format(device_urn=device_urn)
+            
+            return {
+                "measurements": measurements,
+                "max_days": MAX_DATA_DAYS,
+                "external_history_url": external_history_url
+            }
     
     except HTTPException as he:
         raise he
@@ -592,7 +615,7 @@ async def add_device(device: DeviceCreate):
                 device.device_id,
                 device.device_class,
                 device.dev_test,
-                f'https://safecast.org/tilemap/?y1=90&x1=-180&y2=-90&x2=180&l=0&m=0&sense=1&since=0&until=0&devices={device.device_id}'
+                f'https://dashboard.radnote.org/d/cdq671mxg2cjka/radnote-overview?var-device=dev:{device.device_id}'
             ))
             
             # Initialize fetch status
@@ -954,6 +977,33 @@ async def startup_tasks():
                 logger.error(f"Failed to start initial device data fetch: {response.status_code} - {response.text}")
     except Exception as e:
         logger.error(f"Error running startup tasks: {e}")
+
+async def cleanup_old_data():
+    """Remove measurement data older than MAX_DATA_DAYS to keep the database size manageable."""
+    try:
+        with get_db(raise_http_exception=False) as conn:
+            # Calculate the cutoff date
+            cutoff_date = (datetime.utcnow() - timedelta(days=MAX_DATA_DAYS)).isoformat()
+            
+            # Get count of records to be deleted
+            count = conn.execute(
+                "SELECT COUNT(*) FROM measurements WHERE when_captured < CAST(? AS TIMESTAMP)",
+                (cutoff_date,)
+            ).fetchone()[0]
+            
+            if count > 0:
+                # Delete old records
+                conn.execute(
+                    "DELETE FROM measurements WHERE when_captured < CAST(? AS TIMESTAMP)",
+                    (cutoff_date,)
+                )
+                conn.commit()
+                logger.info(f"Deleted {count} measurement records older than {MAX_DATA_DAYS} days")
+            else:
+                logger.info(f"No measurement records older than {MAX_DATA_DAYS} days to delete")
+    except Exception as e:
+        logger.error(f"Error cleaning up old data: {e}")
+        logger.error(traceback.format_exc())
 
 if __name__ == "__main__":
     import uvicorn

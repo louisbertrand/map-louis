@@ -1427,7 +1427,7 @@ async def test_alert(alert: AlertConfig):
         raise HTTPException(status_code=500, detail=f"Failed to send test alert: {str(e)}")
 
 if __name__ == "__main__":
-    import uvicorn
+    # import uvicorn
     
     try:
         # Initialize database
@@ -1437,14 +1437,14 @@ if __name__ == "__main__":
         background_tasks = BackgroundTasks()
         background_tasks.add_task(startup_tasks)
         
-        # Run the server
-        uvicorn.run(
-            "main:app",
-            host="0.0.0.0",
-            port=8000,
-            reload=True,
-            log_level="info"
-        )
+        # # Run the server
+        # uvicorn.run(
+        #     "main:app",
+        #     host="0.0.0.0",
+        #     port=8000,
+        #     reload=True,
+        #     log_level="info"
+        # )
     except Exception as e:
         logger.error(f"Error starting application: {e}")
         logger.error(traceback.format_exc())

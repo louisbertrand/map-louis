@@ -1,4 +1,5 @@
 #!/usr/bin/env sh
+# Start uvicorn app (currently used, based on the gunicorn script)
 
 NAME=map-fastapi-app
 DIR=/usr/local/www/map-louis/radiation-map

@@ -1,0 +1,62 @@
+Create this file as
+ /usr/local/etc/nginx/sites-available/rt-ca.safecast.org 
+
+server {
+    ##
+    # Listen for requests
+    ##
+    listen 80;
+    # port 80 IPv6
+    listen [::]:80;
+
+    server_name rt-ca.safecast.org;
+
+    if ($host = rt-ca.safecast.org) {
+        return 301 https://$host$request_uri;
+    } # managed by Certbot
+
+    return 301 https://$host$request_uri;
+
+#    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+    access_log  /var/log/nginx/rt-ca.safecast.org-access.log ;
+    error_log  /var/log/nginx/rt-ca.safecast.org-error.log;
+
+}
+
+## HTTPS server rt-ca.safecast.org
+    
+server {
+    ##
+    # Listen for requests
+    ##
+    # port 443 IPv4 with ssl
+    listen 443 ssl;
+    # port 443 IPv6 with SSL
+    listen [::]:443 ssl;
+
+    server_name  rt-ca.safecast.org;
+
+    ssl_session_cache    shared:SSL:1m;
+    ssl_session_timeout  5m;
+
+    ssl_certificate /usr/local/etc/letsencrypt/live/rt-ca.safecast.org/fullchain.pem;
+    ssl_certificate_key /usr/local/etc/letsencrypt/live/rt-ca.safecast.org/privkey.pem;
+
+    ssl_ciphers  HIGH:!aNULL:!MD5;
+    ssl_prefer_server_ciphers  on;
+
+    location = /robots.txt {
+       add_header Content-Type text/plain;
+       return 200 "User-agent: *\nDisallow: /\n";
+    }
+
+    location / {
+       root   /usr/local/www/rt-ca.safecast.org;
+       index  index.html index.htm;
+    }
+
+#    log_format  main  '$remote_addr - $remote_user [$time_local] "$request" '
+    access_log  /var/log/nginx/rt-ca.safecast.org-ssl-access.log ;
+    error_log  /var/log/nginx/rt-ca.safecast.org-ssl-error.log;
+
+}

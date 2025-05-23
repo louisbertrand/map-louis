@@ -106,14 +106,7 @@ app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Constants from a separate file (module)
 SAFECAST_API_BASE = constants.SAFECAST_API_BASE
-# SAFECAST_API_BASE = "https://tt.safecast.org"
 DEVICE_URNS = constants.DEVICE_URNS
-# DEVICE_URNS = [
-#     "geigiecast:62007",
-#     "geigiecast-zen:65049",
-#     "geigiecast:62106",
-#     "geigiecast:63209"
-# ]
 
 # Database connection management
 @contextmanager

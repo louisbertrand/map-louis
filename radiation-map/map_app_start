@@ -2,7 +2,7 @@
 # Start uvicorn app (currently used, based on the gunicorn script)
 
 NAME=map-fastapi-app
-DIR=/usr/local/www/map-louis/radiation-map
+DIR=/usr/local/www/rt-ca.safecast.org/map-louis/radiation-map
 USER=louis
 GROUP=louis
 WORKERS=5

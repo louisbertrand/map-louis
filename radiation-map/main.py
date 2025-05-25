@@ -28,6 +28,9 @@ from config import MAX_DATA_DAYS, EXTERNAL_HISTORY_URL, DEFAULT_MAP_CENTER, DEFA
 from config import EMAIL_ENABLED, EMAIL_SERVER, EMAIL_PORT, EMAIL_USERNAME, EMAIL_PASSWORD, EMAIL_FROM
 from config import SMS_ENABLED, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER
 
+# Local imports
+from constants import SAFECAST_API_BASE, DEVICE_URNS
+
 # Set up logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -102,14 +105,6 @@ templates = Jinja2Templates(directory="templates")
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
-# Constants
-SAFECAST_API_BASE = "https://tt.safecast.org"
-DEVICE_URNS = [
-    "geigiecast:62007",
-    "geigiecast-zen:65049",
-    "geigiecast:62106",
-    "geigiecast:63209"
-]
 
 # Database connection management
 @contextmanager

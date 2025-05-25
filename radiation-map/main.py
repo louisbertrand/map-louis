@@ -3,8 +3,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
-from fastapi.staticfiles import StaticFiles
-import duckdb
+# import duckdb
+import sqlite3
 import os
 import httpx
 import asyncio
@@ -27,9 +27,8 @@ from email.mime.multipart import MIMEMultipart
 from config import MAX_DATA_DAYS, EXTERNAL_HISTORY_URL, DEFAULT_MAP_CENTER, DEFAULT_MAP_ZOOM, AUTO_REFRESH_INTERVAL_SECONDS
 from config import EMAIL_ENABLED, EMAIL_SERVER, EMAIL_PORT, EMAIL_USERNAME, EMAIL_PASSWORD, EMAIL_FROM
 from config import SMS_ENABLED, TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_FROM_NUMBER
+import constants  # Application constants and magic numbers
 
-# Local imports
-from constants import SAFECAST_API_BASE, DEVICE_URNS
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -105,10 +104,13 @@ templates = Jinja2Templates(directory="templates")
 # Mount static files
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
+# Constants from a separate file (module)
+SAFECAST_API_BASE = constants.SAFECAST_API_BASE
+DEVICE_URNS = constants.DEVICE_URNS
 
 # Database connection management
 @contextmanager
-def get_db(raise_http_exception: bool = True) -> Generator[duckdb.DuckDBPyConnection, None, None]:
+def get_db(raise_http_exception: bool = True) -> Generator[sqlite3.Connection, None, None]:
     """Get a database connection with proper cleanup.
     
     Args:
@@ -116,7 +118,7 @@ def get_db(raise_http_exception: bool = True) -> Generator[duckdb.DuckDBPyConnec
     """
     conn = None
     try:
-        conn = duckdb.connect('safecast_data.db')
+        conn = sqlite3.connect('safecast_data.db')
         yield conn
     except Exception as e:
         logger.error(f"Database connection error: {e}")
@@ -166,12 +168,12 @@ def init_db():
                 last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )""")
             
-            # Create measurements table - IF NOT EXISTS (though we drop it above, good practice)
+            # # Create measurements table - IF NOT EXISTS (though we drop it above, good practice)
+            # redundant CREATE SEQUENCE IF NOT EXISTS measurements_id_seq;
+            # redundant: DEFAULT nextval('measurements_id_seq'),
             conn.execute("""
-            CREATE SEQUENCE IF NOT EXISTS measurements_id_seq;
-            
-            CREATE TABLE IF NOT EXISTS measurements (
-                id INTEGER PRIMARY KEY DEFAULT nextval('measurements_id_seq'),
+              CREATE TABLE IF NOT EXISTS measurements (
+                id INTEGER PRIMARY KEY,  
                 device_urn TEXT,
                 when_captured TIMESTAMP,
                 lnd_7318u REAL,
@@ -421,7 +423,7 @@ def add_sample_data(conn):
                 print(f"Error inserting measurement: {e}")
 
 # API Endpoints
-@app.get("/", response_class=HTMLResponse)
+@app.get("/map", response_class=HTMLResponse)
 async def read_root(request: Request):
     return templates.TemplateResponse("index.html", {"request": request})
 
@@ -1435,7 +1437,7 @@ if __name__ == "__main__":
         # Run the server
         uvicorn.run(
             "main:app",
-            host="0.0.0.0",
+            host="127.0.0.1",
             port=8000,
             reload=True,
             log_level="info"

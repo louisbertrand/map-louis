@@ -1,0 +1,18 @@
+#!/usr/bin/env sh
+# Start uvicorn app (currently used, based on the gunicorn script)
+
+NAME=map-fastapi-app
+DIR=/usr/local/www/rt-ca.safecast.org/map-louis/radiation-map
+USER=louis
+GROUP=louis
+WORKERS=5
+WORKER_CLASS=uvicorn.workers.UvicornWorker
+VENV=$DIR/venv-map/bin/activate
+BIND=unix:$DIR/run/gunicorn.sock
+LOG_LEVEL=debug
+
+cd $DIR
+. $VENV 
+
+python3 $DIR/main.py
+

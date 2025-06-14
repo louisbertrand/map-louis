@@ -26,7 +26,8 @@ async function initMap() {
             }
             
             // Create a green circular marker with sensor value
-            const reading = Math.round(sensor.last_reading || 0);
+//            const reading =  Math.round(sensor.last_reading * 1000 || 0);
+            const reading =  (sensor.last_reading / 334.0).toFixed(3);
             const marker = L.circleMarker([sensor.latitude, sensor.longitude], {
                 radius: 20, // Increased size
                 fillColor: '#2ecc71',
@@ -39,9 +40,9 @@ async function initMap() {
             // Add the reading value as a div icon with improved styling
             const icon = L.divIcon({
                 className: 'sensor-value-label',
-                html: `<div style="color: white; font-weight: bold; font-size: 16px; display: flex; justify-content: center; align-items: center; width: 100%; height: 100%; text-align: center; margin-top: -3px;">${reading}</div>`,
+                html: `<div style="color: white; font-weight: bold; font-size: 14px; display: flex; justify-content: center; align-items: center; width: 100%; height: 100%; text-align: center; margin-top: -3px;">${reading}</div>`,
                 iconSize: [40, 40], // Increased size
-                iconAnchor: [20, 20] // Centered
+                iconAnchor: [20, 18] // Centered
             });
             
             // Make this marker non-interactive
@@ -410,3 +411,4 @@ async function loadSensorData(sensorId) {
 
 // Initialize the map when the page loads
 document.addEventListener('DOMContentLoaded', initMap); 
+
